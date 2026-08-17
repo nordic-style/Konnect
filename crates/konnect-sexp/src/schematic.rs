@@ -422,11 +422,6 @@ fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
         .and_then(|n| n.as_str())
         .unwrap_or("")
         .to_string();
-    let electrical_type = node
-        .get(1)
-        .and_then(|value| value.as_str())
-        .unwrap_or("")
-        .to_string();
     Some(LibPin {
         number,
         name,
