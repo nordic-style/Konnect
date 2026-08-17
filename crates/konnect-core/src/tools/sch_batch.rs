@@ -278,9 +278,11 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "validate_component_connections",
-            "Check that every selected component pin has at least one wire or label \
-             connected. Can exclude pins whose KiCad electrical type is power_in or \
-             power_out. Reports unconnected pins with type and position.",
+            "Check that every connectable pin on every component has at least one wire \
+             or label connected. Symbol pins typed no_connect and pins carrying a \
+             no-connect marker are exempt; power_in and power_out pins can also be \
+             excluded. Reports unconnected pins with reference, pin number, electrical \
+             type, and schematic position.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1321,6 +1323,13 @@ async fn handle_validate_component_connections(
         if let Some(sym) = lib_sym {
             let t = inst.pin_transform();
             for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+                // A library-declared no-connect pin is intentional by
+                // definition and does not need a placed X marker. This is
+                // distinct from an ordinary pin carrying a schematic
+                // `(no_connect ...)` marker, which is handled below.
+                if pin.electrical_type == "no_connect" {
+                    continue;
+                }
                 if ignore_power_pins
                     && matches!(pin.electrical_type.as_str(), "power_in" | "power_out")
                 {
@@ -1343,7 +1352,8 @@ async fn handle_validate_component_connections(
                         "value": inst.value,
                         "pin": pin.number,
                         "pin_name": pin.name,
-                        "electrical_type": pin.electrical_type,
+                        "electrical_type": pin.electrical_type.clone(),
+                        "pin_type": pin.electrical_type,
                         "x": px,
                         "y": py
                     }));
@@ -1702,6 +1712,90 @@ mod midwire_pin_tests {
                 "with_junction={with_junction}: {body}"
             );
         }
+    }
+
+    fn typed_pin_schematic() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("typed-pins.kicad_sch");
+        std::fs::write(
+            &path,
+            r#"(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:Typed"
+      (symbol "Typed_1_1"
+        (pin no_connect line (at 0 0 0) (length 0)
+          (name "NC" (effects (font (size 1.27 1.27))))
+          (number "1" (effects (font (size 1.27 1.27)))))
+        (pin power_in line (at 0 2.54 0) (length 2.54)
+          (name "VDD" (effects (font (size 1.27 1.27))))
+          (number "2" (effects (font (size 1.27 1.27)))))
+        (pin output line (at 0 5.08 0) (length 2.54)
+          (name "OUT" (effects (font (size 1.27 1.27))))
+          (number "3" (effects (font (size 1.27 1.27))))))
+      (symbol "Typed_2_1"
+        (pin input line (at 0 7.62 0) (length 2.54)
+          (name "OTHER_UNIT" (effects (font (size 1.27 1.27))))
+          (number "4" (effects (font (size 1.27 1.27))))))))
+  (symbol
+    (lib_id "Test:Typed")
+    (at 100 80 0)
+    (unit 1)
+    (uuid "u1")
+    (property "Reference" "U1" (at 100 75 0))
+    (property "Value" "Typed" (at 100 77 0)))
+  (sheet_instances (path "/" (page "1"))))
+"#,
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    async fn validate_components_json(
+        schematic: &std::path::Path,
+        ignore_power_pins: bool,
+    ) -> serde_json::Value {
+        let result = handle_validate_component_connections(
+            &json!({
+                "schematic": schematic.display().to_string(),
+                "ignore_power_pins": ignore_power_pins
+            }),
+            &test_ctx(),
+        )
+        .await
+        .unwrap();
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn declared_no_connect_and_other_unit_pins_are_not_reported() {
+        let (_dir, path) = typed_pin_schematic();
+        let body = validate_components_json(&path, false).await;
+        let pins = body["unconnected_pins"].as_array().unwrap();
+
+        assert_eq!(body["unconnected_count"], 2);
+        assert_eq!(pins[0]["pin"], "2");
+        assert_eq!(pins[0]["pin_type"], "power_in");
+        assert_eq!(pins[1]["pin"], "3");
+        assert_eq!(pins[1]["pin_type"], "output");
+        assert!(pins.iter().all(|pin| pin["pin"] != "1"));
+        assert!(pins.iter().all(|pin| pin["pin"] != "4"));
+    }
+
+    #[tokio::test]
+    async fn ignore_power_pins_option_is_effective() {
+        let (_dir, path) = typed_pin_schematic();
+        let body = validate_components_json(&path, true).await;
+        let pins = body["unconnected_pins"].as_array().unwrap();
+
+        assert_eq!(body["unconnected_count"], 1);
+        assert_eq!(pins[0]["pin"], "3");
+        assert_eq!(pins[0]["pin_type"], "output");
     }
 }
 

@@ -325,7 +325,7 @@ pub fn find_lib_symbol<'a>(
 pub struct LibPin {
     pub number: String,
     pub name: String,
-    /// KiCad electrical type token, e.g. `passive`, `input`, `power_in`.
+    /// KiCad electrical pin type (`input`, `power_in`, `no_connect`, ...).
     pub electrical_type: String,
     /// Position in symbol-local Y-up space (mm).
     pub local_x: f64,
@@ -401,6 +401,11 @@ fn collect_pins_recursive(node: &SexpNode, out: &mut Vec<LibPin>) {
 
 fn parse_lib_pin(node: &SexpNode) -> Option<LibPin> {
     let (x, y, rotation) = parse_at(node)?;
+    let electrical_type = node
+        .get(1)
+        .and_then(|pin_type| pin_type.as_str())
+        .unwrap_or("unspecified")
+        .to_string();
     let length = node
         .find("length")
         .and_then(|l| l.get_f64(1))
@@ -782,7 +787,7 @@ mod unit_pin_tests {
     }
 
     #[test]
-    fn extraction_preserves_the_kicad_electrical_type() {
+    fn extraction_preserves_the_kicad_power_type() {
         let root = parse_sexp(
             "(kicad_symbol_lib (symbol \"PWR\" (pin power_in line (at 0 0 0) \
              (length 2.54) (name \"VDD\") (number \"1\"))))",
@@ -793,6 +798,23 @@ mod unit_pin_tests {
             .next()
             .unwrap();
         assert_eq!(pin.electrical_type, "power_in");
+    }
+
+    #[test]
+    fn extraction_preserves_the_no_connect_type() {
+        let root = parse_sexp(
+            r#"(kicad_symbol_lib
+  (symbol "TEST"
+    (pin no_connect line (at 0 0 0) (length 0)
+      (name "NC" (effects (font (size 1.27 1.27))))
+      (number "1" (effects (font (size 1.27 1.27)))))))"#,
+        )
+        .unwrap();
+        let pin = extract_lib_pins(root.find("symbol").unwrap())
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(pin.electrical_type, "no_connect");
     }
 
     #[test]
