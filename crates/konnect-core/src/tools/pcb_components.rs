@@ -1901,7 +1901,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_component_pads",
-            "Return the pad positions and net assignments for a footprint. \
+            "Return live board-space pad positions, layers and net assignments for a footprint, falling back to the saved board only when KiCAD IPC is unreachable. \
              A pad's 'net' is its net name, \"\" if the pad carries no net node \
              (unconnected), or null if the node is present but unreadable — \
              treat null as an error, not as an unconnected pad.",
@@ -1917,7 +1917,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_pad_position",
-            "Return the schematic-space position of a specific pad number on a footprint.",
+            "Return the live board-space position, layers and net of a specific pad number on a footprint.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2525,36 +2525,22 @@ async fn handle_find_component(
     })))
 }
 
-async fn handle_get_component_pads(
-    args: &serde_json::Value,
-    _ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let board_path = get_path(args, "board")?;
-    let reference = match require_str(args, "reference") {
-        Ok(v) => v.to_string(),
-        Err(e) => return Ok(e),
-    };
-
-    let content = std::fs::read_to_string(&board_path)?;
+fn get_component_pads_from_file(
+    board_path: &Path,
+    reference: &str,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let content = std::fs::read_to_string(board_path)?;
     let tree = konnect_sexp::parser::parse_sexp(&content)?;
 
     // Find the footprint with matching reference
     let fp_node = tree.find_all("footprint").into_iter().find(|fp| {
         fp.find_all("property").iter().any(|p| {
             p.get(1).and_then(|n| n.as_str()) == Some("Reference")
-                && p.get(2).and_then(|n| n.as_str()) == Some(reference.as_str())
+                && p.get(2).and_then(|n| n.as_str()) == Some(reference)
         })
     });
 
-    let fp_node = match fp_node {
-        Some(n) => n,
-        None => {
-            return Ok(CallToolResult::error(format!(
-                "Footprint '{}' not found",
-                reference
-            )))
-        }
-    };
+    let fp_node = fp_node.with_context(|| format!("Footprint '{reference}' not found"))?;
 
     let fp_at = fp_node.find("at");
     let fp_x = fp_at.and_then(|a| a.get_f64(1)).unwrap_or(0.0);
@@ -2586,13 +2572,79 @@ async fn handle_get_component_pads(
                     None => serde_json::Value::Null,
                 },
             };
-            Some(json!({ "number": number, "x": board_x, "y": board_y, "net": net }))
+            let layers: Vec<_> = pad
+                .find("layers")
+                .and_then(konnect_sexp::SexpNode::children)
+                .unwrap_or_default()
+                .iter()
+                .skip(1)
+                .filter_map(konnect_sexp::SexpNode::as_str)
+                .collect();
+            Some(json!({
+                "number": number,
+                "x": board_x,
+                "y": board_y,
+                "net": net,
+                "layers": layers
+            }))
         })
         .collect();
 
-    Ok(CallToolResult::json(
-        &json!({ "reference": reference, "pad_count": pads.len(), "pads": pads }),
-    ))
+    Ok(pads)
+}
+
+async fn handle_get_component_pads(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let board_path = get_path(args, "board")?;
+    let reference = match require_str(args, "reference") {
+        Ok(v) => v.to_string(),
+        Err(e) => return Ok(e),
+    };
+
+    let requested_board = board_path.clone();
+    let requested_reference = reference.clone();
+    let live = with_ipc_classified(ctx.config.ipc_address.clone(), move |client| {
+        client.ensure_board_is_active(&requested_board)?;
+        client.get_footprint_pads(&requested_reference)
+    })
+    .await?;
+
+    let (source, pads) = match live {
+        Ok(pads) => {
+            let values = pads
+                .into_iter()
+                .map(|pad| {
+                    json!({
+                        "number": pad.number,
+                        "x": pad.position.x,
+                        "y": pad.position.y,
+                        "net": pad.net,
+                        "layers": pad.layers,
+                    })
+                })
+                .collect();
+            ("ipc", values)
+        }
+        Err(konnect_ipc::IpcFailure::Unreachable(_)) => {
+            let pads = match get_component_pads_from_file(&board_path, &reference) {
+                Ok(pads) => pads,
+                Err(error) => return Ok(CallToolResult::error(error.to_string())),
+            };
+            ("file", pads)
+        }
+        Err(konnect_ipc::IpcFailure::Rejected(message)) => {
+            return Ok(CallToolResult::error(message));
+        }
+    };
+
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "pad_count": pads.len(),
+        "pads": pads,
+        "source": source
+    })))
 }
 
 async fn handle_get_pad_position(
@@ -2612,7 +2664,11 @@ async fn handle_get_pad_position(
                     .iter()
                     .find(|p| p["number"].as_str() == Some(&pad_number))
                 {
-                    return Ok(CallToolResult::json(pad));
+                    let mut pad = pad.clone();
+                    if let Some(object) = pad.as_object_mut() {
+                        object.insert("source".to_string(), parsed["source"].clone());
+                    }
+                    return Ok(CallToolResult::json(&pad));
                 }
             }
         }

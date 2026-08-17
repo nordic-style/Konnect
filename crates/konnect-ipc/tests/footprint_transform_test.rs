@@ -101,12 +101,18 @@ fn mk_field(name: &str, text: &str, x_mm: f64, y_mm: f64) -> kiapi::board::types
     }
 }
 
-fn mk_pad(x_mm: f64, y_mm: f64) -> prost_types::Any {
+fn mk_pad(number: &str, x_mm: f64, y_mm: f64) -> prost_types::Any {
     builders::pack_any(
         &kiapi::board::types::Pad {
+            number: number.to_string(),
+            net: Some(kiapi::board::types::Net {
+                code: Some(kiapi::board::types::NetCode { value: 1 }),
+                name: "GND".to_string(),
+            }),
             position: Some(builders::vec2(x_mm, y_mm)),
             pad_stack: Some(kiapi::board::types::PadStack {
                 angle: Some(kiapi::common::types::Angle { value_degrees: 0.0 }),
+                layers: vec![kiapi::board::types::BoardLayer::BlFCu as i32],
                 ..Default::default()
             }),
             ..Default::default()
@@ -124,8 +130,8 @@ fn mk_footprint_r1() -> kiapi::board::types::FootprintInstance {
         reference_field: Some(mk_field("Reference", "R1", 100.0, 98.0)),
         definition: Some(kiapi::board::types::Footprint {
             items: vec![
-                mk_pad(99.0, 100.0),
-                mk_pad(101.0, 100.0),
+                mk_pad("1", 99.0, 100.0),
+                mk_pad("2", 101.0, 100.0),
                 builders::pack_any(
                     &builders::board_segment("F.SilkS", 0.12, 99.5, 99.0, 100.5, 99.0),
                     "kiapi.board.types.BoardGraphicShape",
@@ -145,11 +151,26 @@ fn spawn_footprint_mock(fp: kiapi::board::types::FootprintInstance) -> (MockKica
     spawn_footprints_mock(vec![fp])
 }
 
+fn footprint_reference(fp: &kiapi::board::types::FootprintInstance) -> Option<&str> {
+    Some(
+        fp.reference_field
+            .as_ref()?
+            .text
+            .as_ref()?
+            .text
+            .as_ref()?
+            .text
+            .as_str(),
+    )
+}
+
 fn spawn_footprints_mock(
     footprints: Vec<kiapi::board::types::FootprintInstance>,
 ) -> (MockKicad, CapturedUpdate) {
     let captured: CapturedUpdate = Arc::new(Mutex::new(None));
     let captured_in_mock = captured.clone();
+    let current = Arc::new(Mutex::new(footprints));
+    let current_in_mock = current.clone();
 
     let mock = spawn_mock(move |req| {
         let msg = req.message.expect("request must pack a command");
@@ -173,7 +194,9 @@ fn spawn_footprints_mock(
             let resp = kiapi::common::commands::GetItemsResponse {
                 header: None,
                 status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
-                items: footprints
+                items: current_in_mock
+                    .lock()
+                    .unwrap()
                     .iter()
                     .map(|footprint| {
                         builders::pack_any(footprint, "kiapi.board.types.FootprintInstance")
@@ -213,6 +236,21 @@ fn spawn_footprints_mock(
                     item: Some(item),
                 })
                 .collect();
+            let mut current = current_in_mock.lock().unwrap();
+            for item in &update.items {
+                let updated =
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+                let reference = footprint_reference(&updated).map(str::to_string);
+                if let Some(existing) = current
+                    .iter_mut()
+                    .find(|footprint| footprint_reference(footprint) == reference.as_deref())
+                {
+                    *existing = updated;
+                } else {
+                    current.push(updated);
+                }
+            }
+            drop(current);
             *captured_in_mock.lock().unwrap() = Some(update);
             Some(reply_with(builders::pack_any(
                 &kiapi::common::commands::UpdateItemsResponse {
@@ -390,4 +428,40 @@ fn placement_batch_moves_and_rotates_multiple_footprints_in_one_update() {
         .collect();
     assert_eq!(placements, vec![(50.0, 50.0, 90.0), (250.0, 150.0, 180.0)]);
     assert_eq!(pad_positions_mm(&sent[0]), vec![(50.0, 51.0), (50.0, 49.0)]);
+}
+
+#[test]
+fn get_footprint_pads_returns_live_board_coordinates_without_graphic_phantoms() {
+    let (mock, _) = spawn_footprint_mock(mk_footprint_r1());
+    let client = KiCadIpcClient::new(&mock.url);
+
+    let pads = client.get_footprint_pads("R1").unwrap();
+
+    assert_eq!(
+        pads.len(),
+        2,
+        "the silk graphic must not decode as a third pad"
+    );
+    assert_eq!(pads[0].number, "1");
+    assert_eq!((pads[0].position.x, pads[0].position.y), (99.0, 100.0));
+    assert_eq!(pads[0].net, "GND");
+    assert_eq!(pads[0].layers, vec!["F.Cu"]);
+    assert_eq!(pads[1].number, "2");
+    assert_eq!((pads[1].position.x, pads[1].position.y), (101.0, 100.0));
+}
+
+#[test]
+fn get_footprint_pads_reads_the_updated_live_state_after_a_move() {
+    let (mock, _) = spawn_footprint_mock(mk_footprint_r1());
+    let client = KiCadIpcClient::new(&mock.url);
+
+    client.move_footprint("R1", 50.0, 50.0).unwrap();
+    let pads = client.get_footprint_pads("R1").unwrap();
+
+    assert_eq!(
+        pads.iter()
+            .map(|pad| (pad.position.x, pad.position.y))
+            .collect::<Vec<_>>(),
+        vec![(49.0, 50.0), (51.0, 50.0)]
+    );
 }

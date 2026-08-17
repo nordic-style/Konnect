@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcVector2 {
     pub x: f64,
     pub y: f64,
@@ -27,6 +27,15 @@ pub struct IpcFootprintPlacement {
     pub x: f64,
     pub y: f64,
     pub rotation: f64,
+}
+
+/// One placed footprint pad as KiCad currently holds it in board space.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IpcFootprintPad {
+    pub number: String,
+    pub position: IpcVector2,
+    pub net: String,
+    pub layers: Vec<String>,
 }
 
 #[derive(Debug, Clone)]

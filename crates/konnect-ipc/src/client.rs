@@ -984,6 +984,81 @@ impl KiCadIpcClient {
         Ok(footprints.into_iter().find(|fp| fp.reference == reference))
     }
 
+    /// Return the pads of one placed footprint in absolute board coordinates.
+    ///
+    /// `Footprint.items` mixes pads, graphics, text and zones in one repeated
+    /// `Any` field. The declared type URL is therefore checked before decode;
+    /// protobuf decoding alone would accept every graphic as a near-empty pad.
+    pub fn get_footprint_pads(&self, reference: &str) -> Result<Vec<IpcFootprintPad>> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+        let mut found = None;
+
+        for item in items {
+            if !crate::builders::any_is(&item, "kiapi.board.types.FootprintInstance") {
+                continue;
+            }
+            let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+            let item_reference = footprint
+                .reference_field
+                .as_ref()
+                .and_then(|field| field.text.as_ref())
+                .and_then(|text| text.text.as_ref())
+                .map(|text| text.text.as_str())
+                .unwrap_or("");
+            if item_reference != reference {
+                continue;
+            }
+            if found.is_some() {
+                anyhow::bail!(
+                    "footprint reference '{}' appears more than once on the board",
+                    reference
+                );
+            }
+
+            let definition = footprint
+                .definition
+                .as_ref()
+                .with_context(|| format!("footprint '{reference}' has no definition"))?;
+            let mut pads = Vec::new();
+            for child in &definition.items {
+                if !crate::builders::any_is(child, "kiapi.board.types.Pad") {
+                    continue;
+                }
+                let pad = kiapi::board::types::Pad::decode(child.value.as_slice())
+                    .with_context(|| format!("footprint '{reference}' has an unreadable pad"))?;
+                let position = pad.position.with_context(|| {
+                    format!(
+                        "footprint '{reference}' pad '{}' has no position",
+                        pad.number
+                    )
+                })?;
+                let layers = pad
+                    .pad_stack
+                    .as_ref()
+                    .map(|stack| {
+                        stack
+                            .layers
+                            .iter()
+                            .map(|layer| layer_enum_to_name(*layer).to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                pads.push(IpcFootprintPad {
+                    number: pad.number,
+                    position: IpcVector2 {
+                        x: nm_to_mm(position.x_nm),
+                        y: nm_to_mm(position.y_nm),
+                    },
+                    net: pad.net.map(|net| net.name).unwrap_or_default(),
+                    layers,
+                });
+            }
+            found = Some(pads);
+        }
+
+        found.ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))
+    }
+
     /// Find a footprint's KIID by reference.
     fn find_footprint_kiid(&self, reference: &str) -> Result<String> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
