@@ -1267,14 +1267,7 @@ async fn handle_validate_component_connections(
         .unwrap_or_default();
 
     // No-connect positions (pins with intentional no-connect markers are exempt)
-    let no_connect_pts: Vec<(f64, f64)> = tree
-        .find_all("no_connect")
-        .iter()
-        .filter_map(|n| {
-            let at = n.find("at")?;
-            Some((at.get_f64(1)?, at.get_f64(2)?))
-        })
-        .collect();
+    let no_connect_pts = konnect_sexp::schematic::extract_no_connects(&tree);
 
     // Build net graph so we can check connectivity. Junctions matter: a pin
     // sitting mid-wire is connected only through a junction dot, so without

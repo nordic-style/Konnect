@@ -127,9 +127,15 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "find_orphan_items",
-            "Find dangling wire ends, floating labels, and unconnected pin endpoints (0.05mm tolerance).",
+            "Find dangling wire ends, floating labels, and unconnected pin endpoints. \
+             Pins, sheet pins, junctions, and no-connect flags all count as connections.",
             json!({ "type": "object",
-                "properties": { "schematic": { "type": "string" } },
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "tolerance": {
+                        "type": "number", "exclusiveMinimum": 0, "default": 0.05
+                    }
+                },
                 "required": ["schematic"] }),
             |args, ctx| async move { handle_find_orphan_items(args, ctx).await }
         ),
@@ -586,34 +592,238 @@ async fn handle_trace_from_point(
     ))
 }
 
+/// Points bucketed at the coincidence tolerance, so a lookup probes nine cells
+/// instead of scanning every point. `points_coincident` compares an L∞ box of
+/// side `tol`, which the 3×3 neighbourhood covers exactly.
+struct PointIndex {
+    tol: f64,
+    buckets: HashMap<(i64, i64), Vec<(f64, f64)>>,
+}
+
+impl PointIndex {
+    fn build(points: impl IntoIterator<Item = (f64, f64)>, tol: f64) -> Self {
+        let mut index = PointIndex {
+            tol,
+            buckets: HashMap::new(),
+        };
+        for (x, y) in points {
+            let key = index.cell(x, y);
+            index.buckets.entry(key).or_default().push((x, y));
+        }
+        index
+    }
+
+    fn cell(&self, x: f64, y: f64) -> (i64, i64) {
+        ((x / self.tol).floor() as i64, (y / self.tol).floor() as i64)
+    }
+
+    /// How many indexed points coincide with `(x, y)`.
+    fn count_at(&self, x: f64, y: f64) -> usize {
+        let (cx, cy) = self.cell(x, y);
+        let mut found = 0;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                let Some(bucket) = self.buckets.get(&(cx + dx, cy + dy)) else {
+                    continue;
+                };
+                found += bucket
+                    .iter()
+                    .filter(|(px, py)| points_coincident(x, y, *px, *py, self.tol))
+                    .count();
+            }
+        }
+        found
+    }
+
+    fn contains(&self, x: f64, y: f64) -> bool {
+        self.count_at(x, y) > 0
+    }
+}
+
+/// Wires bucketed by the coordinate they hold constant: a horizontal wire can
+/// only be met in its own row, a vertical one in its own column. Mirrors
+/// `point_on_segment`, which answers `false` for anything diagonal.
+struct WireIndex<'a> {
+    tol: f64,
+    rows: HashMap<i64, Vec<&'a Wire>>,
+    columns: HashMap<i64, Vec<&'a Wire>>,
+}
+
+impl<'a> WireIndex<'a> {
+    fn build(wires: &'a [Wire], tol: f64) -> Self {
+        let mut index = WireIndex {
+            tol,
+            rows: HashMap::new(),
+            columns: HashMap::new(),
+        };
+        for wire in wires {
+            if (wire.x1 - wire.x2).abs() < tol {
+                index
+                    .columns
+                    .entry(bucket(wire.x1, tol))
+                    .or_default()
+                    .push(wire);
+            } else if (wire.y1 - wire.y2).abs() < tol {
+                index
+                    .rows
+                    .entry(bucket(wire.y1, tol))
+                    .or_default()
+                    .push(wire);
+            }
+        }
+        index
+    }
+
+    /// Every wire that could pass through `(x, y)`.
+    fn candidates(&self, x: f64, y: f64) -> impl Iterator<Item = &&'a Wire> {
+        let cell_x = bucket(x, self.tol);
+        let cell_y = bucket(y, self.tol);
+        (-1..=1).flat_map(move |delta| {
+            let column = self.columns.get(&(cell_x + delta)).into_iter().flatten();
+            let row = self.rows.get(&(cell_y + delta)).into_iter().flatten();
+            column.chain(row)
+        })
+    }
+
+    /// Lies anywhere on a wire, endpoints included.
+    fn covers(&self, x: f64, y: f64) -> bool {
+        self.candidates(x, y)
+            .any(|wire| point_on_segment(x, y, wire.x1, wire.y1, wire.x2, wire.y2, self.tol))
+    }
+
+    /// Lies on the interior of a wire — a T-junction, which KiCAD connects
+    /// without splitting the crossed wire.
+    fn covers_interior(&self, x: f64, y: f64) -> bool {
+        self.candidates(x, y).any(|wire| {
+            point_on_segment(x, y, wire.x1, wire.y1, wire.x2, wire.y2, self.tol)
+                && !points_coincident(x, y, wire.x1, wire.y1, self.tol)
+                && !points_coincident(x, y, wire.x2, wire.y2, self.tol)
+        })
+    }
+}
+
+fn bucket(value: f64, tolerance: f64) -> i64 {
+    (value / tolerance).floor() as i64
+}
+
 async fn handle_find_orphan_items(
     args: &serde_json::Value,
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
-    let sch = cse::Schematic::load(&sch_path)?;
-    let wires = super::sch_bridge::all_wires_as_sexp(&sch);
-    let labels = super::sch_bridge::all_labels_as_sexp(&sch);
-    let label_pts: HashSet<(i64, i64)> = labels.iter().map(|l| pt_key(l.x, l.y)).collect();
-    let mut endpoint_counts: HashMap<(i64, i64), usize> = HashMap::new();
-    for w in &wires {
-        *endpoint_counts.entry(pt_key(w.x1, w.y1)).or_insert(0) += 1;
-        *endpoint_counts.entry(pt_key(w.x2, w.y2)).or_insert(0) += 1;
+    let tolerance = opt_f64(args, "tolerance").unwrap_or(0.05);
+    if !tolerance.is_finite() || tolerance <= 0.0 {
+        return Ok(CallToolResult::error(
+            "Invalid argument 'tolerance': must be finite and positive",
+        ));
     }
-    let dangling: Vec<serde_json::Value> = endpoint_counts.iter()
-        .filter(|(k, &c)| c == 1 && !label_pts.contains(k))
-        .map(|(k, _)| json!({ "type": "dangling_wire_end", "x": k.0 as f64/1000.0, "y": k.1 as f64/1000.0 }))
-        .collect();
-    let floating: Vec<serde_json::Value> = labels
+
+    let (_, tree) = read_schematic(&sch_path)?;
+    let wires = extract_wires(&tree);
+    let labels = extract_labels(&tree);
+
+    // Unit-aware, so a multi-unit symbol does not contribute another unit's
+    // pins as phantom connection points (#35).
+    let placed = crate::tools::placed_pins_by_reference(&tree);
+    let pins: Vec<(&str, &konnect_sexp::schematic::LibPin, (f64, f64))> = placed
         .iter()
-        .filter(|l| !endpoint_counts.contains_key(&pt_key(l.x, l.y)))
-        .map(|l| json!({ "type": "floating_label", "net": l.net, "x": l.x, "y": l.y }))
+        .flat_map(|(reference, pins)| {
+            pins.iter().map(move |(pin, transform)| {
+                (
+                    reference.as_str(),
+                    pin,
+                    konnect_sexp::schematic::pin_endpoint(pin, *transform),
+                )
+            })
+        })
         .collect();
-    let mut all = dangling;
-    all.extend(floating);
-    Ok(CallToolResult::json(
-        &json!({ "orphan_count": all.len(), "orphans": all }),
-    ))
+
+    let on_wire = WireIndex::build(&wires, tolerance);
+    let wire_ends = PointIndex::build(
+        wires
+            .iter()
+            .flat_map(|wire| [(wire.x1, wire.y1), (wire.x2, wire.y2)]),
+        tolerance,
+    );
+    let label_points = PointIndex::build(labels.iter().map(|label| (label.x, label.y)), tolerance);
+    let pin_points = PointIndex::build(pins.iter().map(|(_, _, at)| *at), tolerance);
+    let junctions = PointIndex::build(extract_junctions(&tree), tolerance);
+    let no_connects = PointIndex::build(
+        konnect_sexp::schematic::extract_no_connects(&tree),
+        tolerance,
+    );
+    let sheet_pins = PointIndex::build(
+        konnect_sexp::schematic::extract_sheet_pins(&tree),
+        tolerance,
+    );
+
+    let mut all: Vec<serde_json::Value> = Vec::new();
+
+    // A wire end is dangling only when nothing terminates it. Ending on a
+    // component or hierarchical sheet pin is the normal case.
+    for wire in &wires {
+        for (x, y) in [(wire.x1, wire.y1), (wire.x2, wire.y2)] {
+            let connected = pin_points.contains(x, y)
+                || label_points.contains(x, y)
+                || sheet_pins.contains(x, y)
+                || junctions.contains(x, y)
+                || no_connects.contains(x, y)
+                // This end is itself indexed; a second hit is another wire.
+                || wire_ends.count_at(x, y) >= 2
+                || on_wire.covers_interior(x, y);
+            if !connected {
+                all.push(json!({
+                    "type": "dangling_wire_end",
+                    "x": x,
+                    "y": y,
+                    "wire_uuid": wire.uuid
+                }));
+            }
+        }
+    }
+
+    // Labels connect anywhere along a wire, not only at its endpoint, or
+    // directly on a bare symbol pin.
+    for label in &labels {
+        if !on_wire.covers(label.x, label.y) && !pin_points.contains(label.x, label.y) {
+            all.push(json!({
+                "type": "floating_label",
+                "net": label.net,
+                "x": label.x,
+                "y": label.y
+            }));
+        }
+    }
+
+    // Report the unconnected pins promised by the tool description. A pin
+    // sitting mid-wire connects only through a junction dot (#104).
+    for (reference, pin, (x, y)) in &pins {
+        let (x, y) = (*x, *y);
+        if pin.electrical_type == "no_connect" || no_connects.contains(x, y) {
+            continue;
+        }
+        let connected = wire_ends.contains(x, y)
+            || label_points.contains(x, y)
+            // This pin is itself indexed; a second hit is a stacked pin.
+            || pin_points.count_at(x, y) >= 2
+            || (junctions.contains(x, y) && on_wire.covers(x, y));
+        if !connected {
+            all.push(json!({
+                "type": "unconnected_pin",
+                "reference": reference,
+                "pin": pin.number,
+                "pin_name": pin.name,
+                "x": x,
+                "y": y
+            }));
+        }
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "orphan_count": all.len(),
+        "orphans": all,
+        "tolerance": tolerance
+    })))
 }
 
 async fn handle_find_shorted_nets(
@@ -1003,5 +1213,209 @@ mod multi_unit_analysis_tests {
         assert_eq!(peer["unit"], 2);
         assert_eq!(peer["connected_pins"].as_array().unwrap().len(), 1);
         assert_eq!(peer["connected_pins"][0]["pin"], "2");
+    }
+}
+
+#[cfg(test)]
+mod orphan_item_tests {
+    use super::*;
+    use crate::tools::ServerConfig;
+    use std::io::Write;
+    use std::sync::Arc;
+
+    /// Run the registered tool against a temporary schematic, exactly as the
+    /// MCP dispatch layer does after selecting its `ToolDef`.
+    async fn call_result(schematic: &str, mut args: serde_json::Value) -> CallToolResult {
+        let mut file = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        file.write_all(schematic.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        args["schematic"] = json!(file.path().to_str().unwrap());
+        let definition = tools()
+            .into_iter()
+            .find(|tool| tool.name == "find_orphan_items")
+            .unwrap();
+        let context = ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(crate::router::ToolRouter::new()),
+        );
+        (definition.handler)(&args, Arc::new(context))
+            .await
+            .unwrap()
+    }
+
+    async fn call(schematic: &str, args: serde_json::Value) -> serde_json::Value {
+        let result = call_result(schematic, args).await;
+        assert!(!result.is_error, "find_orphan_items failed");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    /// One wire from (90,100) to a zero-length pin of U1 at (100,100), a `SIG`
+    /// label mid-segment, a stray `ORPHAN` label, and U2 with nothing on its pin.
+    fn schematic(extra: &str) -> String {
+        format!(
+            r#"(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:P"
+      (symbol "P_1_1"
+        (pin passive line (at 0 0 0) (length 0) (name "A") (number "1"))
+      )
+    )
+  )
+  (wire (pts (xy 90 100) (xy 100 100)) (uuid "w1"))
+  (label "SIG" (at 95 100 0))
+  (label "ORPHAN" (at 200 200 0))
+  (symbol (lib_id "Test:P") (at 100 100 0) (unit 1) (uuid "u1")
+    (property "Reference" "U1" (at 100 100 0))
+    (property "Value" "P" (at 100 100 0))
+  )
+  (symbol (lib_id "Test:P") (at 150 150 0) (unit 1) (uuid "u2")
+    (property "Reference" "U2" (at 150 150 0))
+    (property "Value" "P" (at 150 150 0))
+  )
+{extra}  (sheet_instances (path "/" (page "1")))
+)
+"#
+        )
+    }
+
+    async fn orphans(extra: &str) -> Vec<serde_json::Value> {
+        let body = call(&schematic(extra), json!({})).await;
+        body["orphans"].as_array().unwrap().clone()
+    }
+
+    fn of_type<'a>(items: &'a [serde_json::Value], kind: &str) -> Vec<&'a serde_json::Value> {
+        items.iter().filter(|item| item["type"] == kind).collect()
+    }
+
+    #[tokio::test]
+    async fn a_wire_ending_on_a_pin_is_not_dangling() {
+        let items = orphans("").await;
+        let dangling = of_type(&items, "dangling_wire_end");
+        assert_eq!(dangling.len(), 1, "only the free end counts: {items:?}");
+        assert_eq!(dangling[0]["x"], 90.0);
+        assert_eq!(dangling[0]["wire_uuid"], "w1");
+    }
+
+    #[tokio::test]
+    async fn a_label_mid_segment_is_not_floating() {
+        let items = orphans("").await;
+        let floating = of_type(&items, "floating_label");
+        assert_eq!(floating.len(), 1, "only ORPHAN floats: {items:?}");
+        assert_eq!(floating[0]["net"], "ORPHAN");
+    }
+
+    #[tokio::test]
+    async fn a_pin_with_nothing_on_it_is_reported() {
+        let items = orphans("").await;
+        let pins = of_type(&items, "unconnected_pin");
+        assert_eq!(pins.len(), 1, "U1's pin is wired: {items:?}");
+        assert_eq!(pins[0]["reference"], "U2");
+        assert_eq!(pins[0]["pin"], "1");
+        assert_eq!(pins[0]["pin_name"], "A");
+    }
+
+    /// The reported #249 case: a label directly on a pin without a wire is a
+    /// legal KiCAD connection and connects both items.
+    #[tokio::test]
+    async fn a_label_on_a_bare_pin_connects_both_items() {
+        let items = orphans("  (label \"NC_SIG\" (at 150 150 0))\n").await;
+        let floating = of_type(&items, "floating_label");
+        assert_eq!(floating.len(), 1, "NC_SIG is on U2's pin: {items:?}");
+        assert_eq!(floating[0]["net"], "ORPHAN");
+        assert!(
+            of_type(&items, "unconnected_pin").is_empty(),
+            "the label connects U2: {items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_no_connect_flag_exempts_its_pin() {
+        let items = orphans("  (no_connect (at 150 150) (uuid \"nc1\"))\n").await;
+        assert!(
+            of_type(&items, "unconnected_pin").is_empty(),
+            "no-connect covers U2: {items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_intrinsically_no_connect_pin_is_exempt() {
+        let no_connect_pin = schematic("").replace(
+            "(pin passive line (at 0 0 0)",
+            "(pin no_connect line (at 0 0 0)",
+        );
+        let body = call(&no_connect_pin, json!({})).await;
+        let items = body["orphans"].as_array().unwrap();
+        assert!(
+            of_type(items, "unconnected_pin").is_empty(),
+            "library no-connect pins are intentional: {items:?}"
+        );
+    }
+
+    /// A multi-unit symbol must contribute only the pins from the placed unit.
+    #[tokio::test]
+    async fn another_unit_does_not_contribute_a_phantom_pin() {
+        let schematic = r#"(kicad_sch
+  (version 20260306)
+  (generator "eeschema")
+  (uuid "root")
+  (lib_symbols
+    (symbol "Test:D"
+      (symbol "D_1_1"
+        (pin passive line (at 0 0 0) (length 0) (name "A") (number "1"))
+      )
+      (symbol "D_2_1"
+        (pin passive line (at 10 0 0) (length 0) (name "B") (number "2"))
+      )
+    )
+  )
+  (wire (pts (xy 90 100) (xy 100 100)) (uuid "w1"))
+  (label "SIG" (at 90 100 0))
+  (symbol (lib_id "Test:D") (at 100 100 0) (unit 1) (uuid "u1")
+    (property "Reference" "U1" (at 100 100 0))
+    (property "Value" "D" (at 100 100 0))
+  )
+  (sheet_instances (path "/" (page "1")))
+)
+"#;
+        let body = call(schematic, json!({})).await;
+        assert_eq!(body["orphan_count"], 0, "unit 2 is not placed here: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_wire_ending_on_a_sheet_pin_is_not_dangling() {
+        let sheet = r#"  (sheet (at 80 95) (size 10 10) (uuid "s1")
+    (property "Sheetname" "sub" (at 80 95 0))
+    (property "Sheetfile" "sub.kicad_sch" (at 80 95 0))
+    (pin "SIG" input (at 90 100 180) (uuid "sp1"))
+  )
+"#;
+        let items = orphans(sheet).await;
+        assert!(
+            of_type(&items, "dangling_wire_end").is_empty(),
+            "both ends terminate: {items:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tolerance_must_be_positive() {
+        for tolerance in [0.0, -0.05] {
+            let result = call_result(&schematic(""), json!({ "tolerance": tolerance })).await;
+            assert!(result.is_error, "accepted tolerance {tolerance}");
+        }
     }
 }

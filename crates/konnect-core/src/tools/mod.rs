@@ -411,6 +411,23 @@ pub(crate) fn placed_pins(
     konnect_sexp::schematic::LibPin,
     konnect_sexp::geometry::PinTransform,
 )> {
+    placed_pins_by_reference(tree)
+        .into_iter()
+        .flat_map(|(_, pins)| pins)
+        .collect()
+}
+
+/// [`placed_pins`], grouped under the reference designator that owns each
+/// placed unit, for callers that report pins by name rather than position.
+pub(crate) fn placed_pins_by_reference(
+    tree: &konnect_sexp::SexpNode,
+) -> Vec<(
+    String,
+    Vec<(
+        konnect_sexp::schematic::LibPin,
+        konnect_sexp::geometry::PinTransform,
+    )>,
+)> {
     use konnect_sexp::schematic::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol,
     };
@@ -418,7 +435,7 @@ pub(crate) fn placed_pins(
         .find("lib_symbols")
         .map(|n| n.find_all("symbol"))
         .unwrap_or_default();
-    let mut pins = Vec::new();
+    let mut by_reference = Vec::new();
     for inst in extract_symbol_instances(tree) {
         // find_lib_symbol, not a lib_id match: an instance carrying a
         // (lib_name …) is a sheet-local derived symbol whose pins can sit
@@ -427,13 +444,13 @@ pub(crate) fn placed_pins(
             continue;
         };
         let t = inst.pin_transform();
-        pins.extend(
-            extract_lib_pins_for_unit(sym, inst.unit)
-                .into_iter()
-                .map(|p| (p, t)),
-        );
+        let pins = extract_lib_pins_for_unit(sym, inst.unit)
+            .into_iter()
+            .map(|p| (p, t))
+            .collect();
+        by_reference.push((inst.reference, pins));
     }
-    pins
+    by_reference
 }
 
 /// All symbol pin connection points in a parsed schematic tree. These drive
