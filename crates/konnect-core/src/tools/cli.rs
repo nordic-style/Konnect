@@ -1350,24 +1350,29 @@ mod artifact_verification_tests {
 
     #[test]
     fn pcb_pdf_uses_one_csv_layer_argument_and_one_file_mode() {
-        let args = pcb_pdf_args(
+        let args = single_file_pcb_export_args(
+            "pdf",
             "/out/board.pdf",
+            &["F.Cu", "B.Cu", "F.SilkS", "B.SilkS", "Edge.Cuts"],
+            false,
             "/tmp/board.kicad_pcb",
-            "F.Cu,B.Cu,F.SilkS,B.SilkS,Edge.Cuts",
         );
         assert_eq!(
             args.iter()
-                .filter(|argument| **argument == "--layers")
+                .filter(|argument| argument.as_str() == "--layers")
                 .count(),
             1
         );
         let layers = args
             .iter()
-            .position(|argument| *argument == "--layers")
-            .map(|index| args[index + 1]);
+            .position(|argument| argument == "--layers")
+            .map(|index| args[index + 1].as_str());
         assert_eq!(layers, Some("F.Cu,B.Cu,F.SilkS,B.SilkS,Edge.Cuts"));
-        assert!(args.contains(&"--mode-single"));
-        assert_eq!(args.last().copied(), Some("/tmp/board.kicad_pcb"));
+        assert!(args.iter().any(|argument| argument == "--mode-single"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/tmp/board.kicad_pcb")
+        );
     }
 }
 
