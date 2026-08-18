@@ -634,6 +634,24 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_set_board_text_size(args, ctx).await }
         ),
         tool!(
+            "set_board_text_mirrored",
+            "Set or clear the mirrored flag of one exact board text selected by UUID. Defaults \
+             to a non-mutating dry run; apply requires the exact returned plan revision. \
+             Requires KiCAD running with the requested board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid": { "type": "string", "description": "Exact board-text UUID, for example from a DRC item" },
+                    "mirrored": { "type": "boolean", "description": "Whether the text glyphs are mirrored" },
+                    "dry_run": { "type": "boolean", "default": true },
+                    "expected_plan_revision": { "type": "string", "description": "Exact revision returned by a current dry run; required for apply." }
+                },
+                "required": ["board", "uuid", "mirrored"]
+            }),
+            |args, ctx| async move { handle_set_board_text_mirrored(args, ctx).await }
+        ),
+        tool!(
             "list_zones",
             "List live copper zones with UUID, layers, net, clearance and minimum thickness. \
              Requires KiCAD running with the requested board open.",
@@ -1368,18 +1386,139 @@ fn set_board_text_uniform_size(
     (previous, changed)
 }
 
+#[derive(Clone, Copy)]
+enum BoardTextUpdate {
+    UniformSize(f64),
+    Mirrored(bool),
+}
+
+impl BoardTextUpdate {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::UniformSize(_) => "board text size",
+            Self::Mirrored(_) => "board text mirrored flag",
+        }
+    }
+
+    fn commit_label(self) -> &'static str {
+        match self {
+            Self::UniformSize(_) => "Set board text size",
+            Self::Mirrored(_) => "Set board text mirrored flag",
+        }
+    }
+
+    fn tool_name(self) -> &'static str {
+        match self {
+            Self::UniformSize(_) => "set_board_text_size",
+            Self::Mirrored(_) => "set_board_text_mirrored",
+        }
+    }
+
+    fn undo_description(self) -> &'static str {
+        match self {
+            Self::UniformSize(_) => "Ctrl-Z reverses the board-text size change.",
+            Self::Mirrored(_) => "Ctrl-Z reverses the board-text mirrored-flag change.",
+        }
+    }
+
+    fn hash_into(self, hasher: &mut Sha256) {
+        match self {
+            Self::UniformSize(size) => {
+                hasher.update(b"uniform-size");
+                hasher.update(size.to_le_bytes());
+            }
+            Self::Mirrored(mirrored) => {
+                hasher.update(b"mirrored");
+                hasher.update([u8::from(mirrored)]);
+            }
+        }
+    }
+}
+
+struct BoardTextUpdatePlan {
+    from: serde_json::Value,
+    to: serde_json::Value,
+    changed: bool,
+}
+
+fn board_text_mirrored(text: &konnect_ipc::gen::kiapi::board::types::BoardText) -> bool {
+    text.text
+        .as_ref()
+        .and_then(|text| text.attributes.as_ref())
+        .map(|attributes| attributes.mirrored)
+        .unwrap_or(false)
+}
+
+fn set_board_text_mirrored_value(
+    text: &mut konnect_ipc::gen::kiapi::board::types::BoardText,
+    mirrored: bool,
+) -> (bool, bool) {
+    let previous = board_text_mirrored(text);
+    let changed = previous != mirrored;
+    if changed {
+        let common = text.text.get_or_insert_with(Default::default);
+        let attributes = common.attributes.get_or_insert_with(Default::default);
+        attributes.mirrored = mirrored;
+    }
+    (previous, changed)
+}
+
+fn apply_board_text_update(
+    text: &mut konnect_ipc::gen::kiapi::board::types::BoardText,
+    update: BoardTextUpdate,
+) -> BoardTextUpdatePlan {
+    match update {
+        BoardTextUpdate::UniformSize(size) => {
+            let (previous, changed) = set_board_text_uniform_size(text, size);
+            BoardTextUpdatePlan {
+                from: previous
+                    .map(|(width, height)| json!({ "width": width, "height": height }))
+                    .unwrap_or(serde_json::Value::Null),
+                to: json!({ "width": size, "height": size }),
+                changed,
+            }
+        }
+        BoardTextUpdate::Mirrored(mirrored) => {
+            let (previous, changed) = set_board_text_mirrored_value(text, mirrored);
+            BoardTextUpdatePlan {
+                from: json!(previous),
+                to: json!(mirrored),
+                changed,
+            }
+        }
+    }
+}
+
+fn verify_board_text_update(
+    text: &konnect_ipc::gen::kiapi::board::types::BoardText,
+    update: BoardTextUpdate,
+) -> anyhow::Result<()> {
+    match update {
+        BoardTextUpdate::UniformSize(size) => {
+            let (width, height) = board_text_size_mm(text)
+                .context("updated board text has no font size on read-back")?;
+            if (width - size).abs() >= 0.000_000_5 || (height - size).abs() >= 0.000_000_5 {
+                anyhow::bail!(
+                    "KiCad accepted the board-text update but read back {width} x {height} mm instead of {size} x {size} mm; use Ctrl-Z and inspect the text"
+                );
+            }
+        }
+        BoardTextUpdate::Mirrored(mirrored) => {
+            let read_back = board_text_mirrored(text);
+            if read_back != mirrored {
+                anyhow::bail!(
+                    "KiCad accepted the board-text update but read back mirrored={read_back} instead of mirrored={mirrored}; use Ctrl-Z and inspect the text"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn handle_set_board_text_size(
     args: &serde_json::Value,
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
-    use konnect_ipc::gen::kiapi;
-
-    let board = get_path(args, "board")?;
-    let uuid = match require_str(args, "uuid") {
-        Ok(value) if !value.is_empty() => value.to_string(),
-        Ok(_) => return Ok(CallToolResult::error("Argument 'uuid' must not be empty")),
-        Err(error) => return Ok(error),
-    };
     let size = match require_f64(args, "size") {
         Ok(value) if value.is_finite() && value > 0.0 => value,
         Ok(_) => {
@@ -1387,6 +1526,34 @@ async fn handle_set_board_text_size(
                 "Argument 'size' must be finite and greater than zero",
             ))
         }
+        Err(error) => return Ok(error),
+    };
+    handle_board_text_update(args, ctx, BoardTextUpdate::UniformSize(size)).await
+}
+
+async fn handle_set_board_text_mirrored(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let Some(mirrored) = args.get("mirrored").and_then(serde_json::Value::as_bool) else {
+        return Ok(CallToolResult::error(
+            "Argument 'mirrored' must be a boolean",
+        ));
+    };
+    handle_board_text_update(args, ctx, BoardTextUpdate::Mirrored(mirrored)).await
+}
+
+async fn handle_board_text_update(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    update: BoardTextUpdate,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi;
+
+    let board = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(value) if !value.is_empty() => value.to_string(),
+        Ok(_) => return Ok(CallToolResult::error("Argument 'uuid' must not be empty")),
         Err(error) => return Ok(error),
     };
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
@@ -1400,10 +1567,14 @@ async fn handle_set_board_text_size(
     let requested = board.clone();
     let requested_uuid = uuid.clone();
     let expected_for_ipc = expected_revision.clone();
+    let operation = update.operation();
+    let commit_label = update.commit_label();
+    let undo_description = update.undo_description();
+    let tool_name = update.tool_name();
     let outcome = attempt_ipc_write(
         ctx.config.ipc_address.clone(),
         &board,
-        "board text size",
+        operation,
         move |client| {
             let document = client.find_open_board(&requested)?;
             let items = client.get_items_in(
@@ -1439,16 +1610,16 @@ async fn handle_set_board_text_size(
                         })
                     });
                 let layer = konnect_ipc::client::layer_enum_to_name(text.layer).to_string();
-                let (previous, changed) = set_board_text_uniform_size(&mut text, size);
-                matched = Some((text, label, position, layer, previous, changed));
+                let plan = apply_board_text_update(&mut text, update);
+                matched = Some((text, label, position, layer, plan));
             }
-            let (text, label, position, layer, previous, changed) = matched
+            let (text, label, position, layer, update_plan) = matched
                 .with_context(|| format!("board text UUID '{requested_uuid}' was not found"))?;
 
             let mut hasher = Sha256::new();
             hasher.update(requested.as_os_str().as_encoded_bytes());
             hasher.update(requested_uuid.as_bytes());
-            hasher.update(size.to_le_bytes());
+            update.hash_into(&mut hasher);
             hasher.update(original.as_deref().unwrap_or_default());
             let plan_revision = format!("{:x}", hasher.finalize());
             let candidate = json!({
@@ -1456,11 +1627,11 @@ async fn handle_set_board_text_size(
                 "text": label,
                 "position": position,
                 "layer": layer,
-                "from": previous.map(|(width, height)| json!({ "width": width, "height": height })),
-                "to": { "width": size, "height": size }
+                "from": update_plan.from,
+                "to": update_plan.to
             });
 
-            if !changed {
+            if !update_plan.changed {
                 return Ok(json!({
                     "status": "noop",
                     "plan_revision": plan_revision,
@@ -1493,7 +1664,7 @@ async fn handle_set_board_text_size(
             }
 
             let updated = builders::pack_any(&text, "kiapi.board.types.BoardText");
-            client.run_commit("Set board text size", |client| {
+            client.run_commit(commit_label, |client| {
                 client.update_items_in(document.clone(), vec![updated])
             })?;
 
@@ -1511,13 +1682,7 @@ async fn handle_set_board_text_size(
                         == Some(requested_uuid.as_str())
                 })
                 .context("updated board text disappeared on read-back")?;
-            let (width, height) = board_text_size_mm(&verified)
-                .context("updated board text has no font size on read-back")?;
-            if (width - size).abs() >= 0.000_000_5 || (height - size).abs() >= 0.000_000_5 {
-                anyhow::bail!(
-                    "KiCad accepted the board-text update but read back {width} x {height} mm instead of {size} x {size} mm; use Ctrl-Z and inspect the text"
-                );
-            }
+            verify_board_text_update(&verified, update)?;
 
             Ok(json!({
                 "status": "applied",
@@ -1526,7 +1691,7 @@ async fn handle_set_board_text_size(
                 "updated_count": 1,
                 "candidates": [candidate],
                 "applied": true,
-                "undo": "Ctrl-Z reverses the board-text size change."
+                "undo": undo_description
             }))
         },
     )
@@ -1536,7 +1701,9 @@ async fn handle_set_board_text_size(
         BoardWrite::Ipc(value) => CallToolResult::json(&value),
         BoardWrite::Refused(result) => result,
         BoardWrite::File => CallToolResult::error(
-            "KiCad IPC is unreachable. set_board_text_size is live-IPC-only and never edits the board file directly. Open the requested board in KiCad and retry.",
+            format!(
+                "KiCad IPC is unreachable. {tool_name} is live-IPC-only and never edits the board file directly. Open the requested board in KiCad and retry."
+            ),
         ),
     })
 }
@@ -1943,6 +2110,46 @@ mod board_text_size_tests {
     }
 
     #[test]
+    fn mirrored_update_changes_only_the_mirrored_flag() {
+        let mut text = kiapi::board::types::BoardText {
+            text: Some(kiapi::common::types::Text {
+                text: "BACK".to_string(),
+                attributes: Some(kiapi::common::types::TextAttributes {
+                    size: Some(builders::vec2(0.7, 0.8)),
+                    stroke_width: Some(builders::distance(0.12)),
+                    mirrored: false,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let before_size = board_text_size_mm(&text);
+        let (previous, changed) = set_board_text_mirrored_value(&mut text, true);
+        assert!(!previous);
+        assert!(changed);
+        assert!(board_text_mirrored(&text));
+        assert_eq!(board_text_size_mm(&text), before_size);
+        assert_eq!(
+            text.text
+                .as_ref()
+                .unwrap()
+                .attributes
+                .as_ref()
+                .unwrap()
+                .stroke_width
+                .as_ref()
+                .unwrap()
+                .value_nm,
+            120_000
+        );
+
+        let (_, repeated) = set_board_text_mirrored_value(&mut text, true);
+        assert!(!repeated, "reapplying the same flag must be a no-op");
+    }
+
+    #[test]
     fn board_text_size_tool_requires_revision_bound_inputs() {
         let tool = tools()
             .into_iter()
@@ -1952,6 +2159,18 @@ mod board_text_size_tests {
         assert!(required.contains(&json!("board")));
         assert!(required.contains(&json!("uuid")));
         assert!(required.contains(&json!("size")));
+    }
+
+    #[test]
+    fn board_text_mirrored_tool_requires_revision_bound_inputs() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "set_board_text_mirrored")
+            .expect("tool must be registered");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("board")));
+        assert!(required.contains(&json!("uuid")));
+        assert!(required.contains(&json!("mirrored")));
     }
 }
 

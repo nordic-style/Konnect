@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **20 toolsets** organized into 10 categories
-- **212 registered tools** + **6 always-visible meta-tools** = **218 total**
+- **213 registered tools** + **6 always-visible meta-tools** = **219 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -202,7 +202,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## PCB
 
-### `pcb_board` · 14 tools
+### `pcb_board` · 15 tools
 **Purpose:** Board outline, layers, zones, mounting holes, board text, SVG logo import.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
@@ -218,6 +218,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
 | `set_board_text_size` | Revision-bound update of one exact board text's uniform font size by UUID, with live read-back verification and one KiCad undo commit. |
+| `set_board_text_mirrored` | Revision-bound update of one exact board text's mirrored flag by UUID, with live read-back verification and one KiCad undo commit. |
 | `list_zones` | List live copper zones with UUID, layers, net, clearance and minimum thickness. |
 | `set_zone_min_thickness` | Revision-bound update of one exact zone's minimum copper thickness by UUID, followed by a zone refill and live read-back verification. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. Refuses a net the board does not declare rather than binding copper to net 0, and refuses entirely while KiCad holds the board open. |
