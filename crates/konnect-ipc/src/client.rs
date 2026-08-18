@@ -984,28 +984,30 @@ impl KiCadIpcClient {
         Ok(footprints.into_iter().find(|fp| fp.reference == reference))
     }
 
-    /// Return the pads of one placed footprint in absolute board coordinates.
+    /// Read a placed footprint's pads from the open board, or `None` when no
+    /// footprint carries `reference`.
     ///
-    /// `Footprint.items` mixes pads, graphics, text and zones in one repeated
-    /// `Any` field. The declared type URL is therefore checked before decode;
-    /// protobuf decoding alone would accept every graphic as a near-empty pad.
-    pub fn get_footprint_pads(&self, reference: &str) -> Result<Vec<IpcFootprintPad>> {
-        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;
+    /// Pads come back in absolute board coordinates, because that is how
+    /// KiCad serializes a footprint's children (see the `transform` module) —
+    /// the anchor/rotation transform the file path has to apply is already
+    /// baked in here.
+    pub fn get_footprint_pads_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+    ) -> Result<Option<Vec<IpcPad>>> {
+        let items = self.get_items_in(
+            document,
+            kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+        )?;
         let mut found = None;
-
-        for item in items {
-            if !crate::builders::any_is(&item, "kiapi.board.types.FootprintInstance") {
+        for item in &items {
+            if !crate::builders::any_is(item, "kiapi.board.types.FootprintInstance") {
                 continue;
             }
-            let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
-            let item_reference = footprint
-                .reference_field
-                .as_ref()
-                .and_then(|field| field.text.as_ref())
-                .and_then(|text| text.text.as_ref())
-                .map(|text| text.text.as_str())
-                .unwrap_or("");
-            if item_reference != reference {
+            let fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                .context("KiCad returned an unreadable footprint instance")?;
+            if footprint_reference(&fp) != reference {
                 continue;
             }
             if found.is_some() {
@@ -1015,7 +1017,7 @@ impl KiCadIpcClient {
                 );
             }
 
-            let definition = footprint
+            let definition = fp
                 .definition
                 .as_ref()
                 .with_context(|| format!("footprint '{reference}' has no definition"))?;
@@ -1043,20 +1045,36 @@ impl KiCadIpcClient {
                             .collect()
                     })
                     .unwrap_or_default();
-                pads.push(IpcFootprintPad {
+                pads.push(IpcPad {
                     number: pad.number,
-                    position: IpcVector2 {
-                        x: nm_to_mm(position.x_nm),
-                        y: nm_to_mm(position.y_nm),
-                    },
+                    x: nm_to_mm(position.x_nm),
+                    y: nm_to_mm(position.y_nm),
                     net: pad.net.map(|net| net.name).unwrap_or_default(),
                     layers,
                 });
             }
             found = Some(pads);
         }
+        Ok(found)
+    }
 
-        found.ok_or_else(|| anyhow::anyhow!("Footprint '{}' not found", reference))
+    /// Read the title block of a specific open document.
+    pub fn get_title_block_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<IpcTitleBlock> {
+        let cmd = kiapi::common::commands::GetTitleBlockInfo {
+            document: Some(document),
+        };
+        let response = self.send_command(&cmd, "kiapi.common.commands.GetTitleBlockInfo")?;
+        let info: kiapi::common::types::TitleBlockInfo =
+            unpack_required(response, "GetTitleBlockInfo")?;
+        Ok(IpcTitleBlock {
+            title: info.title,
+            date: info.date,
+            revision: info.revision,
+            company: info.company,
+        })
     }
 
     /// Find a footprint's KIID by reference.
@@ -1929,32 +1947,55 @@ impl KiCadIpcClient {
 
     /// Get enabled layers.
     pub fn get_layers(&self) -> Result<Vec<IpcLayer>> {
-        let doc = self.get_board_document()?;
-        let cmd = kiapi::board::commands::GetBoardEnabledLayers { board: Some(doc) };
+        self.get_layers_in(self.get_board_document()?)
+    }
+
+    /// As [`Self::get_layers`], targeting a specific open document.
+    pub fn get_layers_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<Vec<IpcLayer>> {
+        Ok(self.get_enabled_layers_in(document)?.layers)
+    }
+
+    /// As [`Self::get_layers_in`], keeping the copper count KiCad reports
+    /// beside the layer list instead of leaving callers to derive it.
+    pub fn get_enabled_layers_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<IpcEnabledLayers> {
+        let cmd = kiapi::board::commands::GetBoardEnabledLayers {
+            board: Some(document),
+        };
         let resp_any = self.send_command(&cmd, "kiapi.board.commands.GetBoardEnabledLayers")?;
-        if let Some(any) = resp_any {
-            let resp: kiapi::board::commands::BoardEnabledLayersResponse = unpack_any(&any)?;
-            let layers = resp
-                .layers
-                .iter()
-                .map(|&l| {
-                    let bl = kiapi::board::types::BoardLayer::try_from(l)
-                        .unwrap_or(kiapi::board::types::BoardLayer::BlUndefined);
-                    IpcLayer {
-                        name: bl
-                            .as_str_name()
-                            .trim_start_matches("BL_")
-                            .replace('_', ".")
-                            .to_string(),
-                        id: l,
-                        kind: String::new(),
-                    }
-                })
-                .collect();
-            Ok(layers)
-        } else {
-            Ok(vec![])
-        }
+        let Some(any) = resp_any else {
+            return Ok(IpcEnabledLayers {
+                copper_layer_count: 0,
+                layers: vec![],
+            });
+        };
+        let resp: kiapi::board::commands::BoardEnabledLayersResponse = unpack_any(&any)?;
+        let layers = resp
+            .layers
+            .iter()
+            .map(|&l| {
+                let bl = kiapi::board::types::BoardLayer::try_from(l)
+                    .unwrap_or(kiapi::board::types::BoardLayer::BlUndefined);
+                IpcLayer {
+                    name: bl
+                        .as_str_name()
+                        .trim_start_matches("BL_")
+                        .replace('_', ".")
+                        .to_string(),
+                    id: l,
+                    kind: String::new(),
+                }
+            })
+            .collect();
+        Ok(IpcEnabledLayers {
+            copper_layer_count: resp.copper_layer_count,
+            layers,
+        })
     }
 
     /// Run an arbitrary tool action in KiCAD (e.g. to trigger a refresh).
@@ -2113,6 +2154,18 @@ fn build_graphic_child(
             )
         }
     }
+}
+
+/// The reference designator text of a placed footprint, or `""` when the
+/// instance carries no reference field.
+fn footprint_reference(footprint: &kiapi::board::types::FootprintInstance) -> &str {
+    footprint
+        .reference_field
+        .as_ref()
+        .and_then(|field| field.text.as_ref())
+        .and_then(|text| text.text.as_ref())
+        .map(|text| text.text.as_str())
+        .unwrap_or("")
 }
 
 fn header_for(

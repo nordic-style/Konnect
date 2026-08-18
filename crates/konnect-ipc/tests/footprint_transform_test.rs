@@ -435,7 +435,13 @@ fn get_footprint_pads_returns_live_board_coordinates_without_graphic_phantoms() 
     let (mock, _) = spawn_footprint_mock(mk_footprint_r1());
     let client = KiCadIpcClient::new(&mock.url);
 
-    let pads = client.get_footprint_pads("R1").unwrap();
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+    let pads = client
+        .get_footprint_pads_in(document, "R1")
+        .expect("pad read")
+        .expect("R1 is on the board");
 
     assert_eq!(
         pads.len(),
@@ -443,25 +449,29 @@ fn get_footprint_pads_returns_live_board_coordinates_without_graphic_phantoms() 
         "the silk graphic must not decode as a third pad"
     );
     assert_eq!(pads[0].number, "1");
-    assert_eq!((pads[0].position.x, pads[0].position.y), (99.0, 100.0));
+    assert_eq!((pads[0].x, pads[0].y), (99.0, 100.0));
     assert_eq!(pads[0].net, "GND");
     assert_eq!(pads[0].layers, vec!["F.Cu"]);
     assert_eq!(pads[1].number, "2");
-    assert_eq!((pads[1].position.x, pads[1].position.y), (101.0, 100.0));
+    assert_eq!((pads[1].x, pads[1].y), (101.0, 100.0));
 }
 
 #[test]
-fn get_footprint_pads_reads_the_updated_live_state_after_a_move() {
+fn footprint_pad_readback_observes_the_updated_live_state_after_a_move() {
     let (mock, _) = spawn_footprint_mock(mk_footprint_r1());
     let client = KiCadIpcClient::new(&mock.url);
 
     client.move_footprint("R1", 50.0, 50.0).unwrap();
-    let pads = client.get_footprint_pads("R1").unwrap();
+    let document = client
+        .find_open_board(std::path::Path::new("test.kicad_pcb"))
+        .expect("the mock holds test.kicad_pcb");
+    let pads = client
+        .get_footprint_pads_in(document, "R1")
+        .expect("pad read")
+        .expect("R1 is on the board");
 
     assert_eq!(
-        pads.iter()
-            .map(|pad| (pad.position.x, pad.position.y))
-            .collect::<Vec<_>>(),
+        pads.iter().map(|pad| (pad.x, pad.y)).collect::<Vec<_>>(),
         vec![(49.0, 50.0), (51.0, 50.0)]
     );
 }
