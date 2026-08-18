@@ -168,6 +168,17 @@ pub struct IpcTrack {
     pub end: IpcVector2,
 }
 
+/// A via placed on the live board, addressable by its KiCad UUID.
+///
+/// The routing tools only need identity, net, and position to inspect and
+/// safely remove stale vias. Pad-stack geometry remains owned by KiCad.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpcVia {
+    pub uuid: String,
+    pub net_name: String,
+    pub position: IpcVector2,
+}
+
 /// A graphic item inside a placed footprint — silkscreen, fabrication, or
 /// courtyard artwork, not a pad.
 ///
@@ -225,10 +236,26 @@ pub struct IpcBoardExtents {
 /// from the library footprint so placed parts keep the library's text
 /// positions. A hardcoded offset put the Reference on top of the part's own
 /// silkscreen (silk_overlap DRC warnings in live verification).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct IpcFieldPlacement {
     /// (x, y, rotation) of the Reference text, footprint-local mm/degrees.
     pub reference_at: Option<(f64, f64, f64)>,
     /// (x, y, rotation) of the Value text, footprint-local mm/degrees.
     pub value_at: Option<(f64, f64, f64)>,
+    /// Library layer for the Reference field (normally F.SilkS/B.SilkS).
+    pub reference_layer: Option<String>,
+    /// Library layer for the Value field (normally F.Fab/B.Fab).
+    pub value_layer: Option<String>,
+    /// Visibility specified by the library field.
+    pub reference_visible: Option<bool>,
+    /// Visibility specified by the library field.
+    pub value_visible: Option<bool>,
+    /// Library font size for the Reference field.
+    pub reference_size: Option<(f64, f64)>,
+    /// Library font size for the Value field.
+    pub value_size: Option<(f64, f64)>,
+    /// Library stroke width for the Reference field.
+    pub reference_stroke_width: Option<f64>,
+    /// Library stroke width for the Value field.
+    pub value_stroke_width: Option<f64>,
 }

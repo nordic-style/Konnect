@@ -133,6 +133,11 @@ pub fn tools() -> Vec<ToolDef> {
                     "schematic": { "type": "string", "description": "Saved root .kicad_sch path" },
                     "board": { "type": "string", "description": "Matching .kicad_pcb path currently open in KiCad" },
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
+                    "allow_routed_pad_net_changes": {
+                        "type": "boolean",
+                        "description": "Explicitly allow pad-net reassignment even when either net has routed copper. Use only after checking that no track or via is attached to the affected pad; refill zones after apply.",
+                        "default": false
+                    },
                     "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" }
                 },
                 "required": ["schematic", "board"]

@@ -9,12 +9,15 @@
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, require_f64, require_str, ToolContext, ToolDef};
+use anyhow::Context;
 use konnect_ipc::builders;
 use konnect_sexp::{
     parser::parse_sexp,
     writer::{apply_edits, new_uuid, write_atomic, SexpEdit},
 };
+use prost::Message;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 // Build the 4 Edge.Cuts segments forming a rectangle, packed as Any for create_items.
 fn rect_outline_items(x1: f64, y1: f64, x2: f64, y2: f64, w: f64) -> Vec<prost_types::Any> {
@@ -613,6 +616,56 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_add_board_text(args, ctx).await }
         ),
         tool!(
+            "set_board_text_size",
+            "Set the uniform font size of one exact board text selected by UUID. Defaults to a \
+             non-mutating dry run; apply requires the exact returned plan revision. Requires \
+             KiCAD running with the requested board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid": { "type": "string", "description": "Exact board-text UUID, for example from a DRC item" },
+                    "size": { "type": "number", "exclusiveMinimum": 0, "description": "Uniform glyph width and height in millimetres" },
+                    "dry_run": { "type": "boolean", "default": true },
+                    "expected_plan_revision": { "type": "string", "description": "Exact revision returned by a current dry run; required for apply." }
+                },
+                "required": ["board", "uuid", "size"]
+            }),
+            |args, ctx| async move { handle_set_board_text_size(args, ctx).await }
+        ),
+        tool!(
+            "list_zones",
+            "List live copper zones with UUID, layers, net, clearance and minimum thickness. \
+             Requires KiCAD running with the requested board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "layer": { "type": "string", "description": "Optional exact layer filter, e.g. F.Cu" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_list_zones(args, ctx).await }
+        ),
+        tool!(
+            "set_zone_min_thickness",
+            "Set the minimum copper thickness of one exact zone by UUID, then refill zones. \
+             Defaults to a non-mutating dry run; apply requires the exact returned plan \
+             revision. Requires KiCAD running with the requested board open.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid": { "type": "string" },
+                    "min_thickness": { "type": "number", "exclusiveMinimum": 0, "description": "Minimum filled-copper thickness in millimetres" },
+                    "dry_run": { "type": "boolean", "default": true },
+                    "expected_plan_revision": { "type": "string", "description": "Exact revision returned by a current dry run; required for apply." }
+                },
+                "required": ["board", "uuid", "min_thickness"]
+            }),
+            |args, ctx| async move { handle_set_zone_min_thickness(args, ctx).await }
+        ),
+        tool!(
             "add_zone",
             "Add a copper fill zone polygon on a specified layer and net.",
             json!({
@@ -1193,6 +1246,7 @@ async fn handle_add_mounting_hole(
                 &konnect_ipc::IpcFieldPlacement {
                     reference_at: Some((0.0, text_offset, 0.0)),
                     value_at: Some((0.0, -text_offset, 0.0)),
+                    ..Default::default()
                 },
                 x,
                 y,
@@ -1286,6 +1340,448 @@ async fn handle_add_board_text(
         "text": text, "x": x, "y": y, "layer": layer, "size": size,
         "source": "file"
     })))
+}
+
+fn board_text_size_mm(
+    text: &konnect_ipc::gen::kiapi::board::types::BoardText,
+) -> Option<(f64, f64)> {
+    let size = text.text.as_ref()?.attributes.as_ref()?.size.as_ref()?;
+    Some((
+        size.x_nm as f64 / 1_000_000.0,
+        size.y_nm as f64 / 1_000_000.0,
+    ))
+}
+
+fn set_board_text_uniform_size(
+    text: &mut konnect_ipc::gen::kiapi::board::types::BoardText,
+    size: f64,
+) -> (Option<(f64, f64)>, bool) {
+    let previous = board_text_size_mm(text);
+    let changed = previous.is_none_or(|(width, height)| {
+        (width - size).abs() >= 0.000_000_5 || (height - size).abs() >= 0.000_000_5
+    });
+    if changed {
+        let common = text.text.get_or_insert_with(Default::default);
+        let attributes = common.attributes.get_or_insert_with(Default::default);
+        attributes.size = Some(builders::vec2(size, size));
+    }
+    (previous, changed)
+}
+
+async fn handle_set_board_text_size(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi;
+
+    let board = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(value) if !value.is_empty() => value.to_string(),
+        Ok(_) => return Ok(CallToolResult::error("Argument 'uuid' must not be empty")),
+        Err(error) => return Ok(error),
+    };
+    let size = match require_f64(args, "size") {
+        Ok(value) if value.is_finite() && value > 0.0 => value,
+        Ok(_) => {
+            return Ok(CallToolResult::error(
+                "Argument 'size' must be finite and greater than zero",
+            ))
+        }
+        Err(error) => return Ok(error),
+    };
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
+    if !dry_run && expected_revision.is_none() {
+        return Ok(CallToolResult::error(
+            "Apply requires the plan revision returned by a current dry run.",
+        ));
+    }
+
+    let requested = board.clone();
+    let requested_uuid = uuid.clone();
+    let expected_for_ipc = expected_revision.clone();
+    let outcome = attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board,
+        "board text size",
+        move |client| {
+            let document = client.find_open_board(&requested)?;
+            let items = client.get_items_in(
+                document.clone(),
+                kiapi::common::types::KiCadObjectType::KotPcbText,
+            )?;
+            let mut matched = None;
+            let mut original = None;
+            for item in items {
+                let mut text = kiapi::board::types::BoardText::decode(item.value.as_slice())
+                    .context("KiCad returned an invalid board text")?;
+                let id = text.id.as_ref().map(|id| id.value.as_str()).unwrap_or("");
+                if id != requested_uuid {
+                    continue;
+                }
+                if matched.is_some() {
+                    anyhow::bail!("board text UUID '{requested_uuid}' is not unique");
+                }
+                original = Some(item.value.clone());
+                let label = text
+                    .text
+                    .as_ref()
+                    .map(|text| text.text.clone())
+                    .unwrap_or_default();
+                let position = text
+                    .text
+                    .as_ref()
+                    .and_then(|text| text.position.as_ref())
+                    .map(|position| {
+                        json!({
+                            "x": position.x_nm as f64 / 1_000_000.0,
+                            "y": position.y_nm as f64 / 1_000_000.0
+                        })
+                    });
+                let layer = konnect_ipc::client::layer_enum_to_name(text.layer).to_string();
+                let (previous, changed) = set_board_text_uniform_size(&mut text, size);
+                matched = Some((text, label, position, layer, previous, changed));
+            }
+            let (text, label, position, layer, previous, changed) = matched
+                .with_context(|| format!("board text UUID '{requested_uuid}' was not found"))?;
+
+            let mut hasher = Sha256::new();
+            hasher.update(requested.as_os_str().as_encoded_bytes());
+            hasher.update(requested_uuid.as_bytes());
+            hasher.update(size.to_le_bytes());
+            hasher.update(original.as_deref().unwrap_or_default());
+            let plan_revision = format!("{:x}", hasher.finalize());
+            let candidate = json!({
+                "uuid": requested_uuid,
+                "text": label,
+                "position": position,
+                "layer": layer,
+                "from": previous.map(|(width, height)| json!({ "width": width, "height": height })),
+                "to": { "width": size, "height": size }
+            });
+
+            if !changed {
+                return Ok(json!({
+                    "status": "noop",
+                    "plan_revision": plan_revision,
+                    "candidate_count": 0,
+                    "candidates": [],
+                    "applied": false
+                }));
+            }
+            if dry_run {
+                return Ok(json!({
+                    "status": "ready",
+                    "plan_revision": plan_revision,
+                    "candidate_count": 1,
+                    "candidates": [candidate],
+                    "applied": false
+                }));
+            }
+            if expected_for_ipc.as_deref() != Some(plan_revision.as_str()) {
+                return Ok(json!({
+                    "status": "conflict",
+                    "plan_revision": plan_revision,
+                    "candidate_count": 1,
+                    "candidates": [candidate],
+                    "diagnostics": [{
+                        "code": "stale_plan_revision",
+                        "message": "The live board text changed; rerun dry run and apply its new plan revision."
+                    }],
+                    "applied": false
+                }));
+            }
+
+            let updated = builders::pack_any(&text, "kiapi.board.types.BoardText");
+            client.run_commit("Set board text size", |client| {
+                client.update_items_in(document.clone(), vec![updated])
+            })?;
+
+            let verified = client
+                .get_items_in(
+                    document,
+                    kiapi::common::types::KiCadObjectType::KotPcbText,
+                )?
+                .into_iter()
+                .filter_map(|item| {
+                    kiapi::board::types::BoardText::decode(item.value.as_slice()).ok()
+                })
+                .find(|text| {
+                    text.id.as_ref().map(|id| id.value.as_str())
+                        == Some(requested_uuid.as_str())
+                })
+                .context("updated board text disappeared on read-back")?;
+            let (width, height) = board_text_size_mm(&verified)
+                .context("updated board text has no font size on read-back")?;
+            if (width - size).abs() >= 0.000_000_5 || (height - size).abs() >= 0.000_000_5 {
+                anyhow::bail!(
+                    "KiCad accepted the board-text update but read back {width} x {height} mm instead of {size} x {size} mm; use Ctrl-Z and inspect the text"
+                );
+            }
+
+            Ok(json!({
+                "status": "applied",
+                "plan_revision": plan_revision,
+                "candidate_count": 1,
+                "updated_count": 1,
+                "candidates": [candidate],
+                "applied": true,
+                "undo": "Ctrl-Z reverses the board-text size change."
+            }))
+        },
+    )
+    .await?;
+
+    Ok(match outcome {
+        BoardWrite::Ipc(value) => CallToolResult::json(&value),
+        BoardWrite::Refused(result) => result,
+        BoardWrite::File => CallToolResult::error(
+            "KiCad IPC is unreachable. set_board_text_size is live-IPC-only and never edits the board file directly. Open the requested board in KiCad and retry.",
+        ),
+    })
+}
+
+fn distance_mm(distance: Option<konnect_ipc::gen::kiapi::common::types::Distance>) -> Option<f64> {
+    distance.map(|distance| distance.value_nm as f64 / 1_000_000.0)
+}
+
+fn copper_zone_settings(
+    zone: &konnect_ipc::gen::kiapi::board::types::Zone,
+) -> anyhow::Result<&konnect_ipc::gen::kiapi::board::types::CopperZoneSettings> {
+    use konnect_ipc::gen::kiapi::board::types::zone::Settings;
+    match zone.settings.as_ref() {
+        Some(Settings::CopperSettings(settings)) => Ok(settings),
+        _ => anyhow::bail!("zone is not a copper zone"),
+    }
+}
+
+fn set_copper_zone_min_thickness(
+    zone: &mut konnect_ipc::gen::kiapi::board::types::Zone,
+    min_thickness: f64,
+) -> anyhow::Result<(Option<f64>, bool)> {
+    use konnect_ipc::gen::kiapi::board::types::zone::Settings;
+    let settings = match zone.settings.as_mut() {
+        Some(Settings::CopperSettings(settings)) => settings,
+        _ => anyhow::bail!("zone is not a copper zone"),
+    };
+    let previous = distance_mm(settings.min_thickness);
+    if previous.is_some_and(|value| (value - min_thickness).abs() < 0.000_000_5) {
+        return Ok((previous, false));
+    }
+    settings.min_thickness = Some(builders::distance(min_thickness));
+    Ok((previous, true))
+}
+
+async fn handle_list_zones(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi;
+
+    let board = get_path(args, "board")?;
+    let layer_filter = args["layer"].as_str().map(str::to_string);
+    let requested = board.clone();
+    match with_ipc(ctx.config.ipc_address.clone(), move |client| {
+        let document = client.find_open_board(&requested)?;
+        let mut zones = Vec::new();
+        for item in
+            client.get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbZone)?
+        {
+            let zone = kiapi::board::types::Zone::decode(item.value.as_slice())
+                .context("KiCad returned an invalid zone")?;
+            let layers = zone
+                .layers
+                .iter()
+                .map(|layer| konnect_ipc::client::layer_enum_to_name(*layer).to_string())
+                .collect::<Vec<_>>();
+            if layer_filter
+                .as_ref()
+                .is_some_and(|filter| !layers.contains(filter))
+            {
+                continue;
+            }
+            let settings = match copper_zone_settings(&zone) {
+                Ok(settings) => settings,
+                Err(_) => continue,
+            };
+            zones.push(json!({
+                "uuid": zone.id.as_ref().map(|id| id.value.as_str()).unwrap_or(""),
+                "name": zone.name,
+                "layers": layers,
+                "net": settings.net.as_ref().map(|net| net.name.as_str()).unwrap_or(""),
+                "clearance": distance_mm(settings.clearance),
+                "min_thickness": distance_mm(settings.min_thickness),
+                "priority": zone.priority,
+                "filled": zone.filled,
+                "filled_layer_count": zone.filled_polygons.len()
+            }));
+        }
+        zones.sort_by(|left, right| left["uuid"].as_str().cmp(&right["uuid"].as_str()));
+        Ok(zones)
+    })
+    .await?
+    {
+        Ok(zones) => Ok(CallToolResult::json(&json!({
+            "board": board,
+            "zone_count": zones.len(),
+            "zones": zones,
+            "source": "ipc"
+        }))),
+        Err(error) => Ok(CallToolResult::error(format!(
+            "KiCAD must be running with the board loaded (IPC error: {error})"
+        ))),
+    }
+}
+
+async fn handle_set_zone_min_thickness(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    use konnect_ipc::gen::kiapi;
+
+    let board = get_path(args, "board")?;
+    let uuid = match require_str(args, "uuid") {
+        Ok(value) if !value.is_empty() => value.to_string(),
+        Ok(_) => return Ok(CallToolResult::error("Argument 'uuid' must not be empty")),
+        Err(error) => return Ok(error),
+    };
+    let min_thickness = match require_f64(args, "min_thickness") {
+        Ok(value) if value.is_finite() && value > 0.0 => value,
+        Ok(_) => {
+            return Ok(CallToolResult::error(
+                "Argument 'min_thickness' must be finite and greater than zero",
+            ))
+        }
+        Err(error) => return Ok(error),
+    };
+    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
+    if !dry_run && expected_revision.is_none() {
+        return Ok(CallToolResult::error(
+            "Apply requires the plan revision returned by a current dry run.",
+        ));
+    }
+
+    let requested = board.clone();
+    let requested_uuid = uuid.clone();
+    let expected_for_ipc = expected_revision.clone();
+    let outcome = attempt_ipc_write(
+        ctx.config.ipc_address.clone(),
+        &board,
+        "zone minimum thickness",
+        move |client| {
+            let document = client.find_open_board(&requested)?;
+            let items = client.get_items_in(
+                document.clone(),
+                kiapi::common::types::KiCadObjectType::KotPcbZone,
+            )?;
+            let mut matched = None;
+            let mut original = None;
+            for item in items {
+                let mut zone = kiapi::board::types::Zone::decode(item.value.as_slice())
+                    .context("KiCad returned an invalid zone")?;
+                let id = zone.id.as_ref().map(|id| id.value.as_str()).unwrap_or("");
+                if id != requested_uuid {
+                    continue;
+                }
+                if matched.is_some() {
+                    anyhow::bail!("zone UUID '{requested_uuid}' is not unique");
+                }
+                original = Some(item.value.clone());
+                let (previous, changed) =
+                    set_copper_zone_min_thickness(&mut zone, min_thickness)?;
+                matched = Some((zone, previous, changed));
+            }
+            let (zone, previous, changed) = matched
+                .with_context(|| format!("zone UUID '{requested_uuid}' was not found"))?;
+            let mut hasher = Sha256::new();
+            hasher.update(requested.as_os_str().as_encoded_bytes());
+            hasher.update(requested_uuid.as_bytes());
+            hasher.update(min_thickness.to_le_bytes());
+            hasher.update(original.as_deref().unwrap_or_default());
+            let plan_revision = format!("{:x}", hasher.finalize());
+            let candidate = json!({
+                "uuid": requested_uuid,
+                "from": previous,
+                "to": min_thickness
+            });
+            if !changed {
+                return Ok(json!({
+                    "status": "noop",
+                    "plan_revision": plan_revision,
+                    "candidate_count": 0,
+                    "candidates": [],
+                    "applied": false
+                }));
+            }
+            if dry_run {
+                return Ok(json!({
+                    "status": "ready",
+                    "plan_revision": plan_revision,
+                    "candidate_count": 1,
+                    "candidates": [candidate],
+                    "applied": false
+                }));
+            }
+            if expected_for_ipc.as_deref() != Some(plan_revision.as_str()) {
+                return Ok(json!({
+                    "status": "conflict",
+                    "plan_revision": plan_revision,
+                    "candidate_count": 1,
+                    "candidates": [candidate],
+                    "diagnostics": [{
+                        "code": "stale_plan_revision",
+                        "message": "The live zone changed; rerun dry run and apply its new plan revision."
+                    }],
+                    "applied": false
+                }));
+            }
+
+            let updated = builders::pack_any(&zone, "kiapi.board.types.Zone");
+            client.run_commit("Set zone minimum thickness", |client| {
+                client.update_items_in(document.clone(), vec![updated])
+            })?;
+            client.refill_zones()?;
+
+            let verified = client
+                .get_items_in(document, kiapi::common::types::KiCadObjectType::KotPcbZone)?
+                .into_iter()
+                .filter_map(|item| {
+                    kiapi::board::types::Zone::decode(item.value.as_slice()).ok()
+                })
+                .find(|zone| {
+                    zone.id.as_ref().map(|id| id.value.as_str())
+                        == Some(requested_uuid.as_str())
+                })
+                .context("updated zone disappeared on read-back")?;
+            let readback = distance_mm(copper_zone_settings(&verified)?.min_thickness)
+                .context("updated zone has no minimum thickness on read-back")?;
+            if (readback - min_thickness).abs() >= 0.000_000_5 {
+                anyhow::bail!(
+                    "KiCad accepted the zone update but read back {readback} mm instead of {min_thickness} mm; use Ctrl-Z and inspect the zone"
+                );
+            }
+            Ok(json!({
+                "status": "applied",
+                "plan_revision": plan_revision,
+                "candidate_count": 1,
+                "updated_count": 1,
+                "candidates": [candidate],
+                "applied": true,
+                "zones_refilled": true,
+                "undo": "Ctrl-Z reverses the zone minimum-thickness change."
+            }))
+        },
+    )
+    .await?;
+
+    Ok(match outcome {
+        BoardWrite::Ipc(value) => CallToolResult::json(&value),
+        BoardWrite::Refused(result) => result,
+        BoardWrite::File => CallToolResult::error(
+            "KiCad IPC is unreachable. set_zone_min_thickness is live-IPC-only and never edits the board file directly. Open the requested board in KiCad and retry.",
+        ),
+    })
 }
 
 async fn handle_add_zone(
@@ -1411,6 +1907,113 @@ async fn handle_import_svg_logo(
         "width_mm": width_mm,
         "source": "file"
     })))
+}
+
+#[cfg(test)]
+mod board_text_size_tests {
+    use super::*;
+    use konnect_ipc::gen::kiapi;
+
+    #[test]
+    fn uniform_size_update_changes_only_the_size() {
+        let mut text = kiapi::board::types::BoardText {
+            text: Some(kiapi::common::types::Text {
+                text: "REV A".to_string(),
+                attributes: Some(kiapi::common::types::TextAttributes {
+                    size: Some(builders::vec2(0.7, 0.7)),
+                    stroke_width: Some(builders::distance(0.12)),
+                    mirrored: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let (previous, changed) = set_board_text_uniform_size(&mut text, 0.8);
+        assert_eq!(previous, Some((0.7, 0.7)));
+        assert!(changed);
+        assert_eq!(board_text_size_mm(&text), Some((0.8, 0.8)));
+        let attributes = text.text.as_ref().unwrap().attributes.as_ref().unwrap();
+        assert_eq!(attributes.stroke_width.as_ref().unwrap().value_nm, 120_000);
+        assert!(attributes.mirrored);
+
+        let (_, repeated) = set_board_text_uniform_size(&mut text, 0.8);
+        assert!(!repeated, "reapplying the same size must be a no-op");
+    }
+
+    #[test]
+    fn board_text_size_tool_requires_revision_bound_inputs() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool.name == "set_board_text_size")
+            .expect("tool must be registered");
+        let required = tool.input_schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("board")));
+        assert!(required.contains(&json!("uuid")));
+        assert!(required.contains(&json!("size")));
+    }
+}
+
+#[cfg(test)]
+mod zone_tool_tests {
+    use super::*;
+    use konnect_ipc::gen::kiapi;
+
+    #[test]
+    fn minimum_thickness_update_preserves_every_other_zone_setting() {
+        let settings = kiapi::board::types::CopperZoneSettings {
+            clearance: Some(builders::distance(0.2)),
+            min_thickness: Some(builders::distance(0.25)),
+            net: Some(kiapi::board::types::Net {
+                code: None,
+                name: "GND".to_string(),
+            }),
+            island_mode: kiapi::board::types::IslandRemovalMode::IrmNever as i32,
+            ..Default::default()
+        };
+        let mut zone = kiapi::board::types::Zone {
+            id: Some(kiapi::common::types::Kiid {
+                value: "zone-1".to_string(),
+            }),
+            layers: vec![kiapi::board::types::BoardLayer::BlFCu as i32],
+            priority: 7,
+            settings: Some(kiapi::board::types::zone::Settings::CopperSettings(
+                settings.clone(),
+            )),
+            ..Default::default()
+        };
+
+        let (previous, changed) = set_copper_zone_min_thickness(&mut zone, 0.3).unwrap();
+        assert_eq!(previous, Some(0.25));
+        assert!(changed);
+        let updated = copper_zone_settings(&zone).unwrap();
+        assert_eq!(distance_mm(updated.min_thickness), Some(0.3));
+        assert_eq!(distance_mm(updated.clearance), Some(0.2));
+        assert_eq!(updated.net.as_ref().unwrap().name, "GND");
+        assert_eq!(updated.island_mode, settings.island_mode);
+        assert_eq!(zone.priority, 7);
+        assert_eq!(zone.layers, [kiapi::board::types::BoardLayer::BlFCu as i32]);
+
+        let (_, repeated) = set_copper_zone_min_thickness(&mut zone, 0.3).unwrap();
+        assert!(!repeated, "the same minimum must be a no-op");
+    }
+
+    #[test]
+    fn a_rule_area_is_refused_instead_of_becoming_copper() {
+        let mut zone = kiapi::board::types::Zone {
+            settings: Some(kiapi::board::types::zone::Settings::RuleAreaSettings(
+                kiapi::board::types::RuleAreaSettings::default(),
+            )),
+            ..Default::default()
+        };
+        let before = zone.clone();
+        assert!(set_copper_zone_min_thickness(&mut zone, 0.3)
+            .unwrap_err()
+            .to_string()
+            .contains("not a copper zone"));
+        assert_eq!(zone, before);
+    }
 }
 
 #[cfg(test)]

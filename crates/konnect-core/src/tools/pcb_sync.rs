@@ -174,6 +174,9 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     let schematic = crate::tools::get_path(args, "schematic")?;
     let board = crate::tools::get_path(args, "board")?;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let allow_routed_pad_net_changes = args["allow_routed_pad_net_changes"]
+        .as_bool()
+        .unwrap_or(false);
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
     if !dry_run && expected_revision.is_none() {
         return Ok(CallToolResult::error_kind(
@@ -250,7 +253,12 @@ pub(crate) async fn handle_update_pcb_from_schematic(
         what,
         move |client| {
             let snapshot = snapshot_board(client, &ipc_board)?;
-            let mut plan = plan_sync(&netlist_source, &design, &snapshot.state);
+            let mut plan = plan_sync(
+                &netlist_source,
+                &design,
+                &snapshot.state,
+                allow_routed_pad_net_changes,
+            );
             let prepared = match prepare_additions(&library_board, &plan) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -396,7 +404,12 @@ fn conflict_result(message: String) -> CallToolResult {
     }
 }
 
-fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) -> SyncPlan {
+fn plan_sync(
+    netlist_source: &str,
+    design: &ExportedDesign,
+    board: &BoardState,
+    allow_routed_pad_net_changes: bool,
+) -> SyncPlan {
     let mut diagnostics = Vec::new();
     let mut counts = SyncCounts::default();
     let mut changes = Vec::new();
@@ -613,7 +626,10 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             if old_net == new_net {
                 continue;
             }
-            if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
+            if !allow_routed_pad_net_changes
+                && (board.routed_nets.contains_key(old_net)
+                    || board.routed_nets.contains_key(new_net))
+            {
                 diagnostics.push(conflict(
                     "routed_pad_net_change",
                     format!(
@@ -1323,7 +1339,7 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
                 .as_ref()
                 .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
                 .unwrap_or_default(),
-            symbol_path: footprint.symbol_path.as_ref().map(sheet_path_string),
+            symbol_path: footprint.symbol_path.as_ref().and_then(sheet_path_string),
             pad_nets,
             position: Point {
                 x: position
@@ -1417,15 +1433,23 @@ fn field_text(field: &Option<konnect_ipc::gen::kiapi::board::types::Field>) -> S
         .unwrap_or_default()
 }
 
-fn sheet_path_string(path: &konnect_ipc::gen::kiapi::common::types::SheetPath) -> String {
-    format!(
+fn sheet_path_string(path: &konnect_ipc::gen::kiapi::common::types::SheetPath) -> Option<String> {
+    // KiCad normalises a footprint placed directly on the board to an empty
+    // SheetPath.  That is not the root schematic identity: treating it as
+    // "/" makes every board-only footprint collide and prevents the sync
+    // planner from binding a matching schematic reference later.
+    if path.path.is_empty() {
+        return None;
+    }
+
+    Some(format!(
         "/{}",
         path.path
             .iter()
             .map(|part| part.value.as_str())
             .collect::<Vec<_>>()
             .join("/")
-    )
+    ))
 }
 
 fn board_layer_name(layer: i32) -> String {
@@ -1622,6 +1646,22 @@ fn build_mutation_items(
 mod tests {
     use super::*;
 
+    #[test]
+    fn empty_board_sheet_path_is_not_a_schematic_identity() {
+        use konnect_ipc::gen::kiapi::common::types::{Kiid, SheetPath};
+
+        assert_eq!(sheet_path_string(&SheetPath::default()), None);
+        assert_eq!(
+            sheet_path_string(&SheetPath {
+                path: vec![Kiid {
+                    value: "sheet-uuid".to_string(),
+                }],
+                ..Default::default()
+            }),
+            Some("/sheet-uuid".to_string())
+        );
+    }
+
     const ONE_RESISTOR: &str = r#"
 (export
   (components
@@ -1756,8 +1796,8 @@ mod tests {
             },
         };
 
-        let first = plan_sync("netlist bytes", &design, &board);
-        let second = plan_sync("netlist bytes", &design, &board);
+        let first = plan_sync("netlist bytes", &design, &board, false);
+        let second = plan_sync("netlist bytes", &design, &board, false);
 
         assert_eq!(first.status, PlanStatus::Ready);
         assert_eq!(first.plan_revision, second.plan_revision);
@@ -2175,11 +2215,19 @@ mod tests {
             },
         };
 
-        let plan = plan_sync("netlist", &design, &board);
+        let plan = plan_sync("netlist", &design, &board, false);
 
         assert_eq!(plan.status, PlanStatus::Conflict);
         assert!(plan.changes.is_empty());
         assert!(plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "routed_pad_net_change"));
+
+        let authorized = plan_sync("netlist", &design, &board, true);
+        assert_eq!(authorized.status, PlanStatus::Ready);
+        assert_eq!(authorized.counts.pads_reassigned.planned, 1);
+        assert!(!authorized
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.code == "routed_pad_net_change"));
@@ -2195,6 +2243,7 @@ mod tests {
             "netlist",
             &design,
             &board_with(vec![board_resistor("R1", Some("/sheet/existing"))]),
+            false,
         );
 
         assert_eq!(plan.status, PlanStatus::Noop);
@@ -2210,7 +2259,7 @@ mod tests {
         };
         let mut footprint = board_resistor("R1", Some("/sheet/existing"));
         footprint.footprint_id = "Resistor_SMD:R_0805_2012Metric".to_string();
-        let swap = plan_sync("netlist", &design, &board_with(vec![footprint]));
+        let swap = plan_sync("netlist", &design, &board_with(vec![footprint]), false);
         assert_eq!(swap.status, PlanStatus::Conflict);
         assert!(swap
             .diagnostics
@@ -2221,7 +2270,7 @@ mod tests {
         footprint
             .pad_nets
             .insert("1".to_string(), "OLD_VCC".to_string());
-        let net_change = plan_sync("netlist", &design, &board_with(vec![footprint]));
+        let net_change = plan_sync("netlist", &design, &board_with(vec![footprint]), false);
         assert_eq!(net_change.status, PlanStatus::Ready);
         assert_eq!(net_change.counts.pads_reassigned.planned, 1);
     }
@@ -2235,7 +2284,7 @@ mod tests {
                 symbol_path: "/sheet/existing".to_string(),
             }],
         };
-        let absent = plan_sync("netlist", &design, &board_with(Vec::new()));
+        let absent = plan_sync("netlist", &design, &board_with(Vec::new()), false);
         assert_eq!(absent.status, PlanStatus::Noop);
         assert_eq!(absent.counts.skipped_by_flag.planned, 1);
 
@@ -2243,6 +2292,7 @@ mod tests {
             "netlist",
             &design,
             &board_with(vec![board_resistor("R1", Some("/sheet/existing"))]),
+            false,
         );
         assert_eq!(present.status, PlanStatus::Conflict);
         assert!(present
@@ -2261,6 +2311,7 @@ mod tests {
             "netlist",
             &design,
             &board_with(vec![board_resistor("R1", None)]),
+            false,
         );
 
         assert_eq!(plan.status, PlanStatus::Conflict);
@@ -2299,10 +2350,10 @@ mod tests {
             components: vec![resistor("R1", "/sheet/new")],
             skipped: Vec::new(),
         };
-        let first = plan_sync("netlist", &design, &board_with(Vec::new()));
+        let first = plan_sync("netlist", &design, &board_with(Vec::new()), false);
         let mut changed_board = board_with(Vec::new());
         changed_board.bounds.max_x = 11.0;
-        let second = plan_sync("netlist", &design, &changed_board);
+        let second = plan_sync("netlist", &design, &changed_board, false);
 
         assert_ne!(first.plan_revision, second.plan_revision);
     }

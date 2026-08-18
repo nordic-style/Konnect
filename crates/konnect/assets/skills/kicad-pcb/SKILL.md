@@ -42,11 +42,12 @@ Before any PCB work, load the required toolsets:
 ```
 load_toolset('pcb_board')        # board outline, layers, setup, stackup
 load_toolset('pcb_components')   # place, move, rotate, align footprints
+load_toolset('pcb_inspection')   # inspect footprints, pads, and placed graphics
 load_toolset('pcb_routing')      # traces, vias, differential pairs
 load_toolset('sch_export')       # update PCB from the saved schematic hierarchy
 ```
 
-Zones (`pcb_board`: add_zone; `pcb_routing`: add_copper_pour), component/net queries (`pcb_components`: find_component, get_component_list; `pcb_board`: get_board_info), and bulk placement (`pcb_components`: place_component_array, align_components, duplicate_component) are already covered by the toolsets loaded above.
+Zones (`pcb_board`: add_zone; `pcb_routing`: add_copper_pour), component/net queries (`pcb_inspection`: find_component, get_component_list; `pcb_board`: get_board_info), and bulk placement (`pcb_components`: place_component_array, align_components, duplicate_component) are already covered by the toolsets loaded above.
 
 Load additional toolsets as needed:
 

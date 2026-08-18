@@ -22,7 +22,7 @@ fn nm_to_mm(nm: i64) -> f64 {
 }
 
 /// Map a BoardLayer enum integer back to a KiCAD layer name string.
-fn layer_enum_to_name(layer: i32) -> &'static str {
+pub fn layer_enum_to_name(layer: i32) -> &'static str {
     match kiapi::board::types::BoardLayer::try_from(layer) {
         Ok(l) => match l {
             kiapi::board::types::BoardLayer::BlFCu => "F.Cu",
@@ -1132,6 +1132,41 @@ impl KiCadIpcClient {
         Ok(())
     }
 
+    /// Delete a via by UUID.
+    pub fn delete_via(&self, uuid: &str) -> Result<()> {
+        self.delete_items(vec![uuid.to_string()])
+    }
+
+    /// Query vias, optionally filtered by net name.
+    pub fn get_vias(&self, net_filter: Option<&str>) -> Result<Vec<IpcVia>> {
+        let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbVia)?;
+        let mut vias = Vec::new();
+        for item in &items {
+            if let Ok(via) = kiapi::board::types::Via::decode(item.value.as_slice()) {
+                let net_name = via.net.as_ref().map(|net| net.name.as_str()).unwrap_or("");
+                if let Some(filter) = net_filter {
+                    if net_name != filter {
+                        continue;
+                    }
+                }
+                let position = via.position.as_ref();
+                vias.push(IpcVia {
+                    uuid: via
+                        .id
+                        .as_ref()
+                        .map(|id| id.value.clone())
+                        .unwrap_or_default(),
+                    net_name: net_name.to_string(),
+                    position: IpcVector2 {
+                        x: position.map(|point| nm_to_mm(point.x_nm)).unwrap_or(0.0),
+                        y: position.map(|point| nm_to_mm(point.y_nm)).unwrap_or(0.0),
+                    },
+                });
+            }
+        }
+        Ok(vias)
+    }
+
     /// Delete a track by UUID.
     pub fn delete_track(&self, uuid: &str) -> Result<()> {
         self.delete_items(vec![uuid.to_string()])
@@ -1638,6 +1673,7 @@ impl KiCadIpcClient {
         // check has to happen while a refusal is still possible.
         crate::builders::try_layer_from_name(layer)
             .with_context(|| format!("footprint '{lib_id}' cannot be placed"))?;
+        let back_side = layer == "B.Cu";
         for pad in pads {
             for name in &pad.layers {
                 // `*.Cu`/`*.Mask`/`*.Paste` are KiCAD's own wildcards, expanded
@@ -1645,13 +1681,15 @@ impl KiCadIpcClient {
                 if name.starts_with("*.") {
                     continue;
                 }
-                crate::builders::try_layer_from_name(name).with_context(|| {
+                let target = footprint_child_layer(name, back_side)?;
+                crate::builders::try_layer_from_name(&target).with_context(|| {
                     format!("footprint '{lib_id}' pad '{}' cannot be placed", pad.number)
                 })?;
             }
         }
         for graphic in graphics {
-            crate::builders::try_layer_from_name(graphic.layer()).with_context(|| {
+            let target = footprint_child_layer(graphic.layer(), back_side)?;
+            crate::builders::try_layer_from_name(&target).with_context(|| {
                 format!(
                     "footprint '{lib_id}' has a {} this build cannot place",
                     graphic.kind()
@@ -1659,14 +1697,34 @@ impl KiCadIpcClient {
             })?;
         }
 
-        let text_field = |name: &str, text: &str, local: (f64, f64, f64), visible: bool| {
+        let text_field = |name: &str,
+                          text: &str,
+                          local: (f64, f64, f64),
+                          field_layer: Option<&str>,
+                          visible: bool,
+                          size: Option<(f64, f64)>,
+                          stroke_width: Option<f64>|
+         -> Result<kiapi::board::types::Field> {
             // Field text positions come footprint-local from the library and
             // are transformed exactly like pads, so the placed part keeps the
             // library's text layout instead of a synthesized offset that can
             // sit on the part's own silkscreen.
-            let (fx, fy, frot) = local;
+            let (fx, mut fy, mut frot) = local;
+            if back_side {
+                fy = -fy;
+                frot = 180.0 - frot;
+            }
             let (bx, by) = konnect_sexp::geometry::transform_pad(fx, fy, x, y, rotation);
-            kiapi::board::types::Field {
+            let source_layer = field_layer.unwrap_or("F.SilkS");
+            let target_layer = if field_layer.is_some() {
+                footprint_child_layer(source_layer, back_side)?
+            } else if back_side {
+                "B.SilkS".to_string()
+            } else {
+                "F.SilkS".to_string()
+            };
+            let mirrored = back_side && (field_layer.is_none() || target_layer != source_layer);
+            Ok(kiapi::board::types::Field {
                 id: None,
                 name: name.to_string(),
                 text: Some(kiapi::board::types::BoardText {
@@ -1674,49 +1732,58 @@ impl KiCadIpcClient {
                     text: Some(kiapi::common::types::Text {
                         position: Some(crate::builders::vec2(bx, by)),
                         attributes: Some(kiapi::common::types::TextAttributes {
-                            size: Some(crate::builders::vec2(1.0, 1.0)),
+                            size: Some(crate::builders::vec2(
+                                size.unwrap_or((1.0, 1.0)).0,
+                                size.unwrap_or((1.0, 1.0)).1,
+                            )),
                             angle: Some(kiapi::common::types::Angle {
                                 value_degrees: readable_text_angle(rotation + frot),
                             }),
+                            stroke_width: stroke_width.map(crate::builders::distance),
+                            mirrored,
                             ..Default::default()
                         }),
                         text: text.to_string(),
                         hyperlink: String::new(),
                     }),
-                    layer: crate::builders::layer_from_name(if layer == "B.Cu" {
-                        "B.SilkS"
-                    } else {
-                        "F.SilkS"
-                    }) as i32,
+                    layer: crate::builders::layer_from_name(&target_layer) as i32,
                     knockout: false,
                     locked: kiapi::common::types::LockedState::LsUnlocked as i32,
                 }),
                 visible,
-            }
+            })
         };
         let reference_field = text_field(
             "Reference",
             reference,
             fields.reference_at.unwrap_or((0.0, -1.0, 0.0)),
-            true,
-        );
+            fields.reference_layer.as_deref(),
+            fields.reference_visible.unwrap_or(true),
+            fields.reference_size,
+            fields.reference_stroke_width,
+        )?;
         let value_field = text_field(
             "Value",
             value,
             fields.value_at.unwrap_or((0.0, 1.0, 0.0)),
-            false,
-        );
+            fields.value_layer.as_deref(),
+            fields.value_visible.unwrap_or(false),
+            fields.value_size,
+            fields.value_stroke_width,
+        )?;
         let mut child_items: Vec<prost_types::Any> = pads
             .iter()
-            .map(|pad| {
+            .map(|pad| -> Result<prost_types::Any> {
                 // Canonical KiCAD footprint-local → board transform; see
                 // konnect_sexp::geometry::transform_pad for why the sin terms
                 // are not the textbook rotation matrix (Y axis points down).
+                let local_y = if back_side { -pad.y } else { pad.y };
                 let (board_x, board_y) =
-                    konnect_sexp::geometry::transform_pad(pad.x, pad.y, x, y, rotation);
+                    konnect_sexp::geometry::transform_pad(pad.x, local_y, x, y, rotation);
                 let mut layers = Vec::new();
                 for name in &pad.layers {
-                    match name.as_str() {
+                    let target = footprint_child_layer(name, back_side)?;
+                    match target.as_str() {
                         "*.Cu" => layers.extend(3..=34),
                         "*.Mask" => layers.extend([
                             kiapi::board::types::BoardLayer::BlFMask as i32,
@@ -1781,7 +1848,12 @@ impl KiCadIpcClient {
                         as i32,
                     copper_layers: vec![copper],
                     angle: Some(kiapi::common::types::Angle {
-                        value_degrees: rotation + pad.rotation,
+                        value_degrees: rotation
+                            + if back_side {
+                                -pad.rotation
+                            } else {
+                                pad.rotation
+                            },
                     }),
                     ..Default::default()
                 };
@@ -1799,13 +1871,14 @@ impl KiCadIpcClient {
                     locked: kiapi::common::types::LockedState::LsUnlocked as i32,
                     ..Default::default()
                 };
-                crate::builders::pack_any(&item, "kiapi.board.types.Pad")
+                Ok(crate::builders::pack_any(&item, "kiapi.board.types.Pad"))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         child_items.extend(
             graphics
                 .iter()
-                .map(|graphic| build_graphic_child(graphic, x, y, rotation)),
+                .map(|graphic| build_graphic_child(graphic, x, y, rotation, back_side))
+                .collect::<Result<Vec<_>>>()?,
         );
         let definition = kiapi::board::types::Footprint {
             id: Some(kiapi::common::types::LibraryIdentifier {
@@ -2024,6 +2097,39 @@ fn readable_text_angle(deg: f64) -> f64 {
     angle
 }
 
+/// Map one footprint-local layer through KiCad's front/back flip.
+///
+/// A back-side footprint is not a front-side footprint whose root layer alone
+/// says `B.Cu`: every side-specific child layer must move with it.  Leaving the
+/// pads on `F.Cu` is especially dangerous because KiCad accepts the protobuf
+/// and silently creates real front copper under a part shown on the back.
+fn footprint_child_layer(layer: &str, back_side: bool) -> Result<String> {
+    if !back_side || layer.starts_with("*.") {
+        return Ok(layer.to_string());
+    }
+    let flipped = match layer {
+        "F.Cu" => "B.Cu",
+        "B.Cu" => "F.Cu",
+        "F.Adhes" => "B.Adhes",
+        "B.Adhes" => "F.Adhes",
+        "F.Paste" => "B.Paste",
+        "B.Paste" => "F.Paste",
+        "F.SilkS" => "B.SilkS",
+        "B.SilkS" => "F.SilkS",
+        "F.Mask" => "B.Mask",
+        "B.Mask" => "F.Mask",
+        "F.CrtYd" => "B.CrtYd",
+        "B.CrtYd" => "F.CrtYd",
+        "F.Fab" => "B.Fab",
+        "B.Fab" => "F.Fab",
+        other if other.starts_with("F.") || other.starts_with("B.") => {
+            anyhow::bail!("unsupported side-specific KiCad layer '{other}'")
+        }
+        other => other,
+    };
+    Ok(flipped.to_string())
+}
+
 /// Transform one footprint-local graphic into an absolute-board-space child
 /// item for a `FootprintInstance` (see [`KiCadIpcClient::build_footprint_item`]).
 fn build_graphic_child(
@@ -2031,10 +2137,15 @@ fn build_graphic_child(
     x: f64,
     y: f64,
     rotation: f64,
-) -> prost_types::Any {
+    back_side: bool,
+) -> Result<prost_types::Any> {
     use crate::builders;
     const SHAPE: &str = "kiapi.board.types.BoardGraphicShape";
-    let xf = |(px, py): (f64, f64)| konnect_sexp::geometry::transform_pad(px, py, x, y, rotation);
+    let mirror = |(px, py): (f64, f64)| (px, if back_side { -py } else { py });
+    let xf = |point: (f64, f64)| {
+        let (px, py) = mirror(point);
+        konnect_sexp::geometry::transform_pad(px, py, x, y, rotation)
+    };
     match graphic {
         IpcGraphicDefinition::Line {
             start,
@@ -2042,12 +2153,13 @@ fn build_graphic_child(
             layer,
             width,
         } => {
+            let layer = footprint_child_layer(layer, back_side)?;
             let (x1, y1) = xf(*start);
             let (x2, y2) = xf(*end);
-            builders::pack_any(
-                &builders::board_segment(layer, *width, x1, y1, x2, y2),
+            Ok(builders::pack_any(
+                &builders::board_segment(&layer, *width, x1, y1, x2, y2),
                 SHAPE,
-            )
+            ))
         }
         IpcGraphicDefinition::Rect {
             start,
@@ -2056,14 +2168,15 @@ fn build_graphic_child(
             width,
             filled,
         } => {
+            let layer = footprint_child_layer(layer, back_side)?;
             if is_cardinal_rotation(rotation) {
                 // A 90°-multiple keeps the rectangle axis-aligned; rotate the
                 // corners and re-normalize which one is top-left.
                 let (x1, y1) = xf(*start);
                 let (x2, y2) = xf(*end);
-                builders::pack_any(
+                Ok(builders::pack_any(
                     &builders::board_rectangle(
-                        layer,
+                        &layer,
                         *width,
                         x1.min(x2),
                         y1.min(y2),
@@ -2072,7 +2185,7 @@ fn build_graphic_child(
                         *filled,
                     ),
                     SHAPE,
-                )
+                ))
             } else {
                 // The Rectangle message is axis-aligned by construction, so a
                 // non-cardinal rotation emits the four rotated corners as a
@@ -2083,10 +2196,10 @@ fn build_graphic_child(
                     xf(*end),
                     xf((start.0, end.1)),
                 ];
-                builders::pack_any(
-                    &builders::board_polygon(layer, *width, *filled, &[corners]),
+                Ok(builders::pack_any(
+                    &builders::board_polygon(&layer, *width, *filled, &[corners]),
                     SHAPE,
-                )
+                ))
             }
         }
         IpcGraphicDefinition::Circle {
@@ -2096,14 +2209,15 @@ fn build_graphic_child(
             width,
             filled,
         } => {
+            let layer = footprint_child_layer(layer, back_side)?;
             let (cx, cy) = xf(*center);
             // The radius is rotation-invariant; keep KiCAD's center +
             // circumference-point encoding by re-deriving it from the length.
             let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
-            builders::pack_any(
-                &builders::board_circle(layer, *width, cx, cy, radius, *filled),
+            Ok(builders::pack_any(
+                &builders::board_circle(&layer, *width, cx, cy, radius, *filled),
                 SHAPE,
-            )
+            ))
         }
         IpcGraphicDefinition::Arc {
             start,
@@ -2112,13 +2226,19 @@ fn build_graphic_child(
             layer,
             width,
         } => {
-            let (sx, sy) = xf(*start);
+            let layer = footprint_child_layer(layer, back_side)?;
+            // Mirroring reverses an arc's winding.  Swap its endpoints while
+            // mirroring the coordinates, just as KiCad's file representation
+            // does, so the same physical arc is retained.
+            let source_start = if back_side { *end } else { *start };
+            let source_end = if back_side { *start } else { *end };
+            let (sx, sy) = xf(source_start);
             let (mx, my) = xf(*mid);
-            let (ex, ey) = xf(*end);
-            builders::pack_any(
-                &builders::board_arc(layer, *width, sx, sy, mx, my, ex, ey),
+            let (ex, ey) = xf(source_end);
+            Ok(builders::pack_any(
+                &builders::board_arc(&layer, *width, sx, sy, mx, my, ex, ey),
                 SHAPE,
-            )
+            ))
         }
         IpcGraphicDefinition::Poly {
             points,
@@ -2126,11 +2246,12 @@ fn build_graphic_child(
             width,
             filled,
         } => {
+            let layer = footprint_child_layer(layer, back_side)?;
             let transformed: Vec<(f64, f64)> = points.iter().map(|p| xf(*p)).collect();
-            builders::pack_any(
-                &builders::board_polygon(layer, *width, *filled, &[transformed]),
+            Ok(builders::pack_any(
+                &builders::board_polygon(&layer, *width, *filled, &[transformed]),
                 SHAPE,
-            )
+            ))
         }
         IpcGraphicDefinition::Text {
             text,
@@ -2139,19 +2260,25 @@ fn build_graphic_child(
             layer,
             size,
         } => {
+            let target_layer = footprint_child_layer(layer, back_side)?;
             let (tx, ty) = xf(*position);
-            builders::pack_any(
+            let local_rotation = if back_side {
+                180.0 - text_rotation
+            } else {
+                *text_rotation
+            };
+            Ok(builders::pack_any(
                 &builders::board_text(
-                    layer,
+                    &target_layer,
                     text,
                     tx,
                     ty,
                     *size,
-                    readable_text_angle(text_rotation + rotation),
-                    false,
+                    readable_text_angle(local_rotation + rotation),
+                    back_side && target_layer != *layer,
                 ),
                 "kiapi.board.types.BoardText",
-            )
+            ))
         }
     }
 }
@@ -2382,6 +2509,132 @@ mod footprint_graphics_tests {
                 .unwrap()
                 .value_degrees,
             90.0
+        );
+    }
+
+    /// Refreshing a footprint already placed on the back must rebuild the
+    /// library definition in KiCad's mirrored frame.  Merely changing the
+    /// instance's root layer leaves its pads and artwork on the front, which
+    /// is valid protobuf but wrong copper.
+    #[test]
+    fn back_side_build_mirrors_children_and_swaps_their_layers() {
+        let pads = vec![IpcPadDefinition {
+            number: "1".to_string(),
+            pad_type: "smd".to_string(),
+            shape: "roundrect".to_string(),
+            x: 1.0,
+            y: 2.0,
+            rotation: 30.0,
+            size_x: 1.2,
+            size_y: 0.8,
+            drill_x: None,
+            drill_y: None,
+            drill_oval: false,
+            layers: vec![
+                "F.Cu".to_string(),
+                "F.Paste".to_string(),
+                "F.Mask".to_string(),
+            ],
+            roundrect_ratio: 0.2,
+        }];
+        let graphics = vec![
+            IpcGraphicDefinition::Line {
+                start: (0.0, 1.0),
+                end: (2.0, 1.0),
+                layer: "F.SilkS".to_string(),
+                width: 0.12,
+            },
+            IpcGraphicDefinition::Text {
+                text: "back".to_string(),
+                position: (0.0, 3.0),
+                rotation: 0.0,
+                layer: "F.Fab".to_string(),
+                size: 0.5,
+            },
+        ];
+        let fields = crate::types::IpcFieldPlacement {
+            reference_at: Some((0.0, -1.0, 0.0)),
+            reference_layer: Some("F.SilkS".to_string()),
+            ..Default::default()
+        };
+        let client = KiCadIpcClient::new("tcp://never-dialed");
+        let any = client
+            .build_footprint_item(
+                "Lib:Fp", "R1", "R", &pads, &graphics, &fields, 100.0, 50.0, 0.0, "B.Cu",
+            )
+            .unwrap();
+        let fp = kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
+
+        assert_eq!(fp.layer, kiapi::board::types::BoardLayer::BlBCu as i32);
+        let items = &fp.definition.as_ref().unwrap().items;
+        let pad = items
+            .iter()
+            .find(|item| item.type_url.ends_with("types.Pad"))
+            .map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()).unwrap())
+            .unwrap();
+        let position = pad.position.unwrap();
+        assert_eq!((position.x_nm, position.y_nm), (101_000_000, 48_000_000));
+        let stack = pad.pad_stack.unwrap();
+        assert_eq!(stack.angle.unwrap().value_degrees, -30.0);
+        assert!(stack
+            .layers
+            .contains(&(kiapi::board::types::BoardLayer::BlBCu as i32)));
+        assert!(stack
+            .layers
+            .contains(&(kiapi::board::types::BoardLayer::BlBPaste as i32)));
+        assert!(stack
+            .layers
+            .contains(&(kiapi::board::types::BoardLayer::BlBMask as i32)));
+        assert!(!stack
+            .layers
+            .contains(&(kiapi::board::types::BoardLayer::BlFCu as i32)));
+
+        let line = shapes(&fp).remove(0);
+        assert_eq!(line.layer, kiapi::board::types::BoardLayer::BlBSilkS as i32);
+        let kiapi::common::types::graphic_shape::Geometry::Segment(segment) =
+            line.shape.unwrap().geometry.unwrap()
+        else {
+            panic!("expected mirrored line");
+        };
+        assert_eq!(
+            (segment.start.unwrap().x_nm, segment.start.unwrap().y_nm),
+            (100_000_000, 49_000_000)
+        );
+        assert_eq!(
+            (segment.end.unwrap().x_nm, segment.end.unwrap().y_nm),
+            (102_000_000, 49_000_000)
+        );
+
+        let graphic_text = texts(&fp).remove(0);
+        assert_eq!(
+            graphic_text.layer,
+            kiapi::board::types::BoardLayer::BlBFab as i32
+        );
+        let graphic_attributes = graphic_text.text.unwrap().attributes.unwrap();
+        assert!(graphic_attributes.mirrored);
+
+        let reference_board_text = fp.reference_field.unwrap().text.unwrap();
+        assert_eq!(
+            reference_board_text.layer,
+            kiapi::board::types::BoardLayer::BlBSilkS as i32
+        );
+        let reference = reference_board_text.text.unwrap();
+        assert_eq!(
+            reference.position.unwrap().y_nm,
+            51_000_000,
+            "local y=-1 must mirror to +1 on the board"
+        );
+        let reference_attributes = reference.attributes.unwrap();
+        assert!(reference_attributes.mirrored);
+        assert_eq!(
+            fp.definition
+                .unwrap()
+                .reference_field
+                .unwrap()
+                .text
+                .unwrap()
+                .layer,
+            kiapi::board::types::BoardLayer::BlBSilkS as i32
         );
     }
 

@@ -12,8 +12,8 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **19 toolsets** organized into 10 categories
-- **204 registered tools** + **6 always-visible meta-tools** = **210 total**
+- **20 toolsets** organized into 10 categories
+- **212 registered tools** + **6 always-visible meta-tools** = **218 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -25,7 +25,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 19 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 20 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -177,7 +177,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `export_netlist_summary` | Return a human-readable JSON netlist summary (components, nets, pin counts). Does not require kicad-cli. |
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
-| `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. |
+| `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. Routed pad-net reassignment remains blocked unless `allow_routed_pad_net_changes` is explicitly enabled after a local copper check. |
 
 ### `sch_hierarchy` · 12 tools
 **Purpose:** Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
@@ -202,7 +202,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 ## PCB
 
-### `pcb_board` · 11 tools
+### `pcb_board` · 14 tools
 **Purpose:** Board outline, layers, zones, mounting holes, board text, SVG logo import.
 **Source:** [`crates/konnect-core/src/tools/pcb_board.rs`](crates/konnect-core/src/tools/pcb_board.rs)
 
@@ -217,11 +217,14 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_board_outline` | Add a rectangular Edge.Cuts outline with sharp or circular rounded corners, identically over IPC and file fallback. |
 | `add_mounting_hole` | Add an NPTH mounting hole footprint at the specified position. |
 | `add_board_text` | Add a silkscreen or fabrication text string to the board. |
+| `set_board_text_size` | Revision-bound update of one exact board text's uniform font size by UUID, with live read-back verification and one KiCad undo commit. |
+| `list_zones` | List live copper zones with UUID, layers, net, clearance and minimum thickness. |
+| `set_zone_min_thickness` | Revision-bound update of one exact zone's minimum copper thickness by UUID, followed by a zone refill and live read-back verification. |
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. Refuses a net the board does not declare rather than binding copper to net 0, and refuses entirely while KiCad holds the board open. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
-### `pcb_components` · 18 tools
-**Purpose:** Place, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics.
+### `pcb_components` · 14 tools
+**Purpose:** Place, move, rotate, flip, align, duplicate and repair PCB footprints.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
 | Tool | Description |
@@ -234,18 +237,28 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |
 | `edit_component` | Update the value or other properties of a placed footprint via KiCAD IPC. |
 | `repair_corrupted_footprints` | Dry-run and atomically repair the exact legacy corruption from issue #244: anonymous layerless pads that replaced footprint drawing shapes. Restores the affected shapes from the registered library while preserving live placement, identity, pad nets and non-shape children; apply requires the dry-run revision and is one KiCAD undo commit. |
+| `refresh_footprints_from_library` | Dry-run and atomically refresh selected footprints from their registered libraries while preserving board identity, placement, pad nets and side. Back-side children are mirrored with their layers, and library-owned NetTie pad groups and explicit stroke styles are preserved. |
+| `set_footprint_field_visibility` | Show or hide Reference or Value fields for selected footprints in one revision-bound KiCAD undo commit. |
+| `set_pad_zone_connections` | Set exact per-pad zone connection overrides (`inherited`, `none`, `thermal`, `solid`, or `pth_thermal`) in one revision-bound KiCAD undo commit and refill zones. |
+| `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
+| `align_components` | Align multiple footprints along a common X or Y axis via KiCAD IPC. |
+| `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
+
+### `pcb_inspection` · 7 tools
+**Purpose:** Inspect PCB footprints, pads and placed-footprint graphics; render a board preview.
+**Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
+
+| Tool | Description |
+|------|-------------|
 | `find_component` | Find a footprint by reference designator and return its position. |
 | `list_board_footprint_graphics` | List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Reports `editable`, plus `outlines` and `holes` for polygons. Requires KiCAD running with the board open. |
 | `edit_board_footprint_graphic` | Replace the vertices of a single-outline polygon inside a placed footprint, selected by UUID, without re-placing the part. Anything with multiple outlines or holes is refused by name rather than flattened. Requires KiCAD running with the board open. |
 | `get_component_pads` | Return live board-space pad positions, layers, and net assignments when KiCAD IPC is reachable; fall back to the saved board only when IPC is unreachable. A pad whose saved net node is present but unreadable reports `null` rather than an empty string. |
 | `get_pad_position` | Return the live board-space position, layers, and net assignment of a specific pad number. |
 | `get_component_list` | List all footprints on the board with positions, layers, and values. |
-| `place_component_array` | Place multiple copies of a footprint in a grid or line array via KiCAD IPC. |
-| `align_components` | Align multiple footprints along a common X or Y axis via KiCAD IPC. |
-| `duplicate_component` | Duplicate an existing footprint at a new position via KiCAD IPC. |
 | `get_board_2d_view` | Render the board with kicad-cli and return a base64 PNG. This is the 3-D render viewed from the top, not a layer plot, and takes no layer selection — use `export_svg` for layer-aware output. |
 
-### `pcb_routing` · 12 tools
+### `pcb_routing` · 14 tools
 **Purpose:** Traces, vias, copper pours, net classes, differential pairs.
 **Source:** [`crates/konnect-core/src/tools/pcb_routing.rs`](crates/konnect-core/src/tools/pcb_routing.rs)
 
@@ -255,6 +268,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `route_trace` | Route a trace segment between two points on a copper layer via KiCAD IPC. |
 | `route_pad_to_pad` | Route a direct trace between two pads of named components (L-bend routing) via IPC. |
 | `add_via` | Add a through-hole via at a position and assign it to a net via IPC. |
+| `delete_via` | Delete a via by its live KiCad UUID. |
+| `query_vias` | List vias, optionally filtered by net, with UUIDs for safe deletion. |
 | `add_copper_pour` | Add a copper fill zone polygon on a layer/net via S-expression insert. Same net and board-open refusals as `add_zone`. |
 | `delete_trace` | Delete a trace segment identified by its UUID via KiCAD IPC. |
 | `query_traces` | List trace segments on the board, optionally filtered by net and/or layer. |

@@ -159,6 +159,32 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_add_via(args, ctx).await }
         ),
         tool!(
+            "delete_via",
+            "Delete a via identified by its UUID via KiCAD IPC.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string" },
+                    "uuid":  { "type": "string", "description": "UUID of the via to delete" }
+                },
+                "required": ["board", "uuid"]
+            }),
+            |args, ctx| async move { handle_delete_via(args, ctx).await }
+        ),
+        tool!(
+            "query_vias",
+            "List vias on the board, optionally filtered by net. Each result includes the via UUID accepted by delete_via.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board":    { "type": "string" },
+                    "net_name": { "type": "string", "description": "Filter by net (optional)" }
+                },
+                "required": ["board"]
+            }),
+            |args, ctx| async move { handle_query_vias(args, ctx).await }
+        ),
+        tool!(
             "add_copper_pour",
             "Add a copper fill zone polygon on a layer/net via S-expression file insert.",
             json!({
@@ -578,6 +604,42 @@ async fn handle_add_copper_pour(
 
     Ok(CallToolResult::json(
         &json!({ "net": net_name, "layer": layer, "points": pts.len() }),
+    ))
+}
+
+async fn handle_delete_via(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let uuid = match require_str(args, "uuid") {
+        Ok(value) => value.to_string(),
+        Err(error) => return Ok(error),
+    };
+
+    let uuid_ipc = uuid.clone();
+    ipc!(ctx, args, |client| client.delete_via(&uuid_ipc));
+    Ok(CallToolResult::json(&json!({ "deleted_uuid": uuid })))
+}
+
+async fn handle_query_vias(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let net = args["net_name"].as_str().map(String::from);
+    let vias = ipc!(ctx, args, |client| client.get_vias(net.as_deref()));
+    let items: Vec<serde_json::Value> = vias
+        .iter()
+        .map(|via| {
+            json!({
+                "uuid": via.uuid,
+                "net": via.net_name,
+                "x": via.position.x,
+                "y": via.position.y
+            })
+        })
+        .collect();
+    Ok(CallToolResult::json(
+        &json!({ "count": items.len(), "vias": items }),
     ))
 }
 

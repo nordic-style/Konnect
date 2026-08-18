@@ -5,7 +5,10 @@
 //!
 //! These tools work on the S-expression files directly — no KiCAD running required.
 
-use super::cli;
+use super::{
+    cli,
+    sch_analysis::{build_net_graph, NetGraph},
+};
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{get_path, project_name_for, sch_hierarchy, ToolContext, ToolDef};
@@ -13,8 +16,9 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     parser::parse_sexp,
     schematic::{
-        extract_labels, extract_lib_pins, extract_lib_pins_for_unit, extract_symbol_instances,
-        find_lib_symbol, pin_endpoint, read_schematic,
+        extract_junctions, extract_labels, extract_lib_pins, extract_lib_pins_for_unit,
+        extract_symbol_instances, extract_wires, find_lib_symbol, pin_endpoint, read_schematic,
+        LibPin, SymbolInstance,
     },
 };
 use serde_json::{json, Value};
@@ -143,7 +147,7 @@ async fn handle_audit_decoupling(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     info!(schematic = %sch_path.display(), "[BETA] Running decoupling audit");
-    let (content, tree) = read_schematic(&sch_path)?;
+    let (_content, tree) = read_schematic(&sch_path)?;
 
     let instances = extract_symbol_instances(&tree);
     let lib_syms = tree
@@ -156,7 +160,8 @@ async fn handle_audit_decoupling(
     let mut total_power_pins = 0;
 
     // Collect all capacitor references and their net connections
-    let cap_nets = collect_capacitor_nets(&content, &instances, &lib_syms);
+    let mut net_graph = schematic_net_graph(&tree);
+    let cap_nets = collect_capacitor_nets(&mut net_graph, &instances, &lib_syms);
 
     // For each IC (non-passive, non-connector component), check power pins
     for inst in &instances {
@@ -181,7 +186,7 @@ async fn handle_audit_decoupling(
 
         // Find power pins (power_in type, or named VCC/VDD/VBUS/3V3/etc.)
         for pin in &pins {
-            let is_power_pin = is_power_pin_name(&pin.name);
+            let is_power_pin = is_power_pin(pin);
             if !is_power_pin {
                 continue;
             }
@@ -191,7 +196,7 @@ async fn handle_audit_decoupling(
             let (px, py) = pin_endpoint(pin, inst.pin_transform());
 
             // Check if there's a capacitor connected to a net that this pin is on
-            let pin_net = find_net_at_point(&content, px, py);
+            let pin_net = net_graph.net_at(px, py);
 
             let has_decoupling = if let Some(ref net) = pin_net {
                 cap_nets.contains(net)
@@ -249,7 +254,7 @@ async fn handle_audit_connections(
 ) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     info!(schematic = %sch_path.display(), "[BETA] Running connection audit");
-    let (content, tree) = read_schematic(&sch_path)?;
+    let (_content, tree) = read_schematic(&sch_path)?;
 
     let instances = extract_symbol_instances(&tree);
     let lib_syms = tree
@@ -258,6 +263,7 @@ async fn handle_audit_connections(
         .unwrap_or_default();
 
     let mut findings = Vec::new();
+    let mut net_graph = schematic_net_graph(&tree);
 
     for inst in &instances {
         let lib_sym = match find_lib_symbol(&lib_syms, inst) {
@@ -275,9 +281,9 @@ async fn handle_audit_connections(
             for (pin_name, pin) in [("SDA", sda_pin), ("SCL", scl_pin)] {
                 if let Some(pin) = pin {
                     let (px, py) = pin_endpoint(pin, inst.pin_transform());
-                    let net = find_net_at_point(&content, px, py);
+                    let net = net_graph.net_at(px, py);
                     if let Some(ref net_name) = net {
-                        if !has_pull_up_on_net(&content, &instances, &lib_syms, net_name) {
+                        if !has_pull_up_on_net(&mut net_graph, &instances, &lib_syms, net_name) {
                             findings.push(AuditFinding {
                                 severity: "warning",
                                 category: "connection",
@@ -303,10 +309,13 @@ async fn handle_audit_connections(
             if (name_upper.contains("RESET") || name_upper.contains("NRST") || name_upper == "RST")
                 && !name_upper.contains("OUT")
             {
+                if reset_pin_has_internal_pull_up(inst, pin) {
+                    continue;
+                }
                 let (px, py) = pin_endpoint(pin, inst.pin_transform());
-                let net = find_net_at_point(&content, px, py);
+                let net = net_graph.net_at(px, py);
                 if let Some(ref net_name) = net {
-                    if !has_pull_up_on_net(&content, &instances, &lib_syms, net_name) {
+                    if !has_pull_up_on_net(&mut net_graph, &instances, &lib_syms, net_name) {
                         findings.push(AuditFinding {
                             severity: "warning",
                             category: "connection",
@@ -358,8 +367,9 @@ async fn handle_audit_power_rails(
     let power_nets = collect_power_nets(&content);
 
     // Check each power net for bulk capacitance
-    let cap_nets = collect_capacitor_nets(&content, &instances, &lib_syms);
-    let bulk_cap_nets = collect_bulk_cap_nets(&content, &instances, &lib_syms);
+    let mut net_graph = schematic_net_graph(&tree);
+    let cap_nets = collect_capacitor_nets(&mut net_graph, &instances, &lib_syms);
+    let bulk_cap_nets = collect_bulk_cap_nets(&mut net_graph, &instances, &lib_syms);
 
     for net in &power_nets {
         if net.to_uppercase().contains("GND") || net.to_uppercase().contains("VSS") {
@@ -374,7 +384,7 @@ async fn handle_audit_power_rails(
                 issue: format!("Power rail '{}' has no decoupling capacitors", net),
                 recommendation: format!("Add at least one 100nF ceramic cap on the '{}' rail", net),
             });
-        } else if !bulk_cap_nets.contains(net.as_str()) {
+        } else if rail_requires_bulk_capacitance(net) && !bulk_cap_nets.contains(net.as_str()) {
             findings.push(AuditFinding {
                 severity: "warning",
                 category: "power",
@@ -389,7 +399,7 @@ async fn handle_audit_power_rails(
     }
 
     // Check for test points on power rails
-    let test_point_nets = collect_test_point_nets(&content, &instances);
+    let test_point_nets = collect_test_point_nets(&mut net_graph, &instances, &lib_syms);
     for net in &power_nets {
         if net.to_uppercase().contains("GND") {
             continue;
@@ -414,6 +424,39 @@ async fn handle_audit_power_rails(
         }))
         .unwrap(),
     ))
+}
+
+/// A blanket 10uF requirement is not valid for low-voltage logic rails: an
+/// LDO or module output may require 1uF, 100nF, or another datasheet-specific
+/// value, and extra capacitance can violate its stability/start-up limits.
+/// Reserve the generic bulk warning for explicitly named 5V-and-higher rails;
+/// lower rails are still checked for local decoupling above.
+fn rail_requires_bulk_capacitance(net: &str) -> bool {
+    let name = net
+        .trim()
+        .trim_start_matches(['+', '-'])
+        .to_ascii_uppercase();
+    let Some(v_index) = name.find('V') else {
+        return false;
+    };
+    let whole = &name[..v_index];
+    if whole.is_empty() || !whole.chars().all(|character| character.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(mut voltage) = whole.parse::<f64>() else {
+        return false;
+    };
+    let fractional = name[v_index + 1..]
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect::<String>();
+    if !fractional.is_empty() {
+        let Ok(value) = fractional.parse::<f64>() else {
+            return false;
+        };
+        voltage += value / 10_f64.powi(fractional.len() as i32);
+    }
+    voltage >= 5.0
 }
 
 // ─── Manufacturing audit ─────────────────────────────────────────────────────
@@ -1062,7 +1105,16 @@ async fn handle_check_bom_health(
 
         // Check for missing MPN (per-component check via properties)
         let has_mpn = sym.property("MPN").is_some() || sym.property("LCSC").is_some();
-        if reference.starts_with('U') && !has_mpn {
+        let sourcing_status = sym
+            .property("BOM_Status")
+            .or_else(|| sym.property("Assembly_Status"))
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let explicitly_not_procured = matches!(
+            sourcing_status.as_str(),
+            "USER_SUPPLIED" | "CUSTOMER_SUPPLIED" | "DNP" | "DO_NOT_PROCURE"
+        );
+        if reference.starts_with('U') && !has_mpn && !explicitly_not_procured {
             missing_mpn += 1;
             findings.push(AuditFinding {
                 severity: "warning",
@@ -1098,25 +1150,52 @@ async fn handle_check_bom_health(
 
 // ─── Helper functions ────────────────────────────────────────────────────────
 
+fn schematic_net_graph(tree: &konnect_sexp::parser::SexpNode) -> NetGraph {
+    let wires = extract_wires(tree);
+    let labels = extract_labels(tree);
+    let junctions = extract_junctions(tree);
+    build_net_graph(&wires, &labels, &junctions)
+}
+
+/// Audit only pins whose symbol explicitly declares a supply input and whose
+/// name looks like a supply. Name-only matching used to classify measurement
+/// inputs (`Vin+`) and power-control outputs (`SD_PWR_ON`, `nPI_LED_PWR`) as
+/// supply pins, producing recommendations that would electrically damage or
+/// mis-bias otherwise valid circuits.
+fn is_power_pin(pin: &LibPin) -> bool {
+    pin.electrical_type == "power_in" && is_power_pin_name(&pin.name)
+}
+
 fn is_power_pin_name(name: &str) -> bool {
     let upper = name.to_uppercase();
-    upper.starts_with("VCC")
-        || upper.starts_with("VDD")
-        || upper.starts_with("VBUS")
-        || upper.starts_with("V+")
-        || upper.starts_with("VIN")
-        || upper.starts_with("3V3")
-        || upper.starts_with("5V")
-        || upper.starts_with("1V")
-        || upper.starts_with("2V")
-        || upper == "AVCC"
-        || upper == "AVDD"
-        || upper == "DVCC"
-        || upper == "DVDD"
-        || upper.starts_with("VCAP")
-        || upper.starts_with("VREF")
-        || upper.contains("POWER")
-        || upper.contains("PWR")
+    let supply = upper.strip_prefix('+').unwrap_or(&upper);
+    supply.starts_with("VCC")
+        || supply.starts_with("VDD")
+        || supply.starts_with("VBUS")
+        || supply.starts_with("V+")
+        || supply.starts_with("VIN")
+        || supply == "VS"
+        || supply.starts_with("3V3")
+        || supply.starts_with("5V")
+        || supply.starts_with("1V")
+        || supply.starts_with("2V")
+        || supply == "AVCC"
+        || supply == "AVDD"
+        || supply == "DVCC"
+        || supply == "DVDD"
+        || supply.starts_with("VCAP")
+        || supply.contains("VREF")
+}
+
+/// Known modules whose datasheets state that RESETn is internally pulled up
+/// and that an external pull-up is not recommended. Keep this deliberately
+/// narrow: adding a family here requires an explicit manufacturer guarantee.
+fn reset_pin_has_internal_pull_up(inst: &SymbolInstance, pin: &LibPin) -> bool {
+    if !pin.name.to_uppercase().contains("RESET") {
+        return false;
+    }
+    let id = inst.lib_id.to_uppercase();
+    id.contains("MGM240P") || id.contains("BGM240P")
 }
 
 fn has_i2c_pins(pins: &[konnect_sexp::schematic::LibPin]) -> bool {
@@ -1126,7 +1205,7 @@ fn has_i2c_pins(pins: &[konnect_sexp::schematic::LibPin]) -> bool {
 
 /// Collect nets that have at least one capacitor connected.
 fn collect_capacitor_nets(
-    content: &str,
+    net_graph: &mut NetGraph,
     instances: &[konnect_sexp::schematic::SymbolInstance],
     lib_syms: &[&konnect_sexp::parser::SexpNode],
 ) -> HashSet<String> {
@@ -1140,7 +1219,7 @@ fn collect_capacitor_nets(
             let pins = extract_lib_pins_for_unit(sym, inst.unit);
             for pin in &pins {
                 let (px, py) = pin_endpoint(pin, inst.pin_transform());
-                if let Some(net) = find_net_at_point(content, px, py) {
+                if let Some(net) = net_graph.net_at(px, py) {
                     nets.insert(net);
                 }
             }
@@ -1151,7 +1230,7 @@ fn collect_capacitor_nets(
 
 /// Collect nets that have bulk capacitors (>= 10uF).
 fn collect_bulk_cap_nets(
-    content: &str,
+    net_graph: &mut NetGraph,
     instances: &[konnect_sexp::schematic::SymbolInstance],
     lib_syms: &[&konnect_sexp::parser::SexpNode],
 ) -> HashSet<String> {
@@ -1182,7 +1261,7 @@ fn collect_bulk_cap_nets(
             let pins = extract_lib_pins_for_unit(sym, inst.unit);
             for pin in &pins {
                 let (px, py) = pin_endpoint(pin, inst.pin_transform());
-                if let Some(net) = find_net_at_point(content, px, py) {
+                if let Some(net) = net_graph.net_at(px, py) {
                     nets.insert(net);
                 }
             }
@@ -1267,21 +1346,29 @@ fn is_power_net_name(name: &str) -> bool {
 
 /// Collect nets that have test points connected.
 fn collect_test_point_nets(
-    _content: &str,
+    net_graph: &mut NetGraph,
     instances: &[konnect_sexp::schematic::SymbolInstance],
+    lib_syms: &[&konnect_sexp::parser::SexpNode],
 ) -> HashSet<String> {
-    let nets = HashSet::new();
+    let mut nets = HashSet::new();
     for inst in instances {
         if inst.reference.starts_with("TP") || inst.value.to_uppercase().contains("TESTPOINT") {
-            // Find the net this test point is on (simplified: look for nearby label)
-            // A proper implementation would trace the wire
+            let Some(sym) = find_lib_symbol(lib_syms, inst) else {
+                continue;
+            };
+            for pin in extract_lib_pins_for_unit(sym, inst.unit) {
+                let (px, py) = pin_endpoint(&pin, inst.pin_transform());
+                if let Some(net) = net_graph.net_at(px, py) {
+                    nets.insert(net);
+                }
+            }
         }
     }
     nets
 }
 
 fn has_pull_up_on_net(
-    content: &str,
+    net_graph: &mut NetGraph,
     instances: &[konnect_sexp::schematic::SymbolInstance],
     lib_syms: &[&konnect_sexp::parser::SexpNode],
     net_name: &str,
@@ -1298,7 +1385,7 @@ fn has_pull_up_on_net(
                 .iter()
                 .map(|p| {
                     let (px, py) = pin_endpoint(p, inst.pin_transform());
-                    find_net_at_point(content, px, py)
+                    net_graph.net_at(px, py)
                 })
                 .collect();
 
@@ -1314,62 +1401,6 @@ fn has_pull_up_on_net(
         }
     }
     false
-}
-
-/// Find the net name at a given schematic point by checking nearby labels and wires.
-fn find_net_at_point(content: &str, x: f64, y: f64) -> Option<String> {
-    // Check plain labels near this point (KiCAD's tag is `label`, not
-    // `net_label` — the latter matched nothing in any real schematic).
-    let tolerance = 0.5; // mm
-    let mut search = 0;
-    while let Some(pos) = content[search..].find("(label \"") {
-        let abs = search + pos;
-        let after = &content[abs + 8..];
-        let name_end = after.find('"')?;
-        let name = &after[..name_end];
-
-        // Find the (at X Y) in this label
-        let block_end = content[abs..].find(")\n").unwrap_or(200) + abs;
-        let block = &content[abs..block_end.min(content.len())];
-        if let Some(at_pos) = block.find("(at ") {
-            let at_str = &block[at_pos + 4..];
-            let parts: Vec<&str> = at_str.split([' ', ')']).take(2).collect();
-            if parts.len() >= 2 {
-                if let (Ok(lx), Ok(ly)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                    if (lx - x).abs() < tolerance && (ly - y).abs() < tolerance {
-                        return Some(name.to_string());
-                    }
-                }
-            }
-        }
-        search = abs + 1;
-    }
-
-    // Also check global_labels
-    search = 0;
-    while let Some(pos) = content[search..].find("(global_label \"") {
-        let abs = search + pos;
-        let after = &content[abs + 15..];
-        let name_end = after.find('"')?;
-        let name = &after[..name_end];
-
-        let block_end = content[abs..].find(")\n").unwrap_or(200) + abs;
-        let block = &content[abs..block_end.min(content.len())];
-        if let Some(at_pos) = block.find("(at ") {
-            let at_str = &block[at_pos + 4..];
-            let parts: Vec<&str> = at_str.split([' ', ')']).take(2).collect();
-            if parts.len() >= 2 {
-                if let (Ok(lx), Ok(ly)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
-                    if (lx - x).abs() < tolerance && (ly - y).abs() < tolerance {
-                        return Some(name.to_string());
-                    }
-                }
-            }
-        }
-        search = abs + 1;
-    }
-
-    None
 }
 
 fn check_silkscreen_overlap(
@@ -1474,6 +1505,31 @@ mod review_completion_tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    fn test_pin(name: &str, electrical_type: &str) -> LibPin {
+        LibPin {
+            number: "1".to_string(),
+            name: name.to_string(),
+            electrical_type: electrical_type.to_string(),
+            local_x: 0.0,
+            local_y: 0.0,
+            rotation: 0.0,
+            length: 2.54,
+        }
+    }
+
+    #[test]
+    fn decoupling_audit_uses_pin_type_not_powerish_substrings() {
+        assert!(!is_power_pin(&test_pin("Vin+", "input")));
+        assert!(!is_power_pin(&test_pin("SD_PWR_ON", "output")));
+        assert!(!is_power_pin(&test_pin("nPI_LED_PWR", "output")));
+        assert!(!is_power_pin(&test_pin("GND", "power_in")));
+        assert!(is_power_pin(&test_pin("+5v_(Input)", "power_in")));
+        assert!(is_power_pin(&test_pin(
+            "GPIO_VREF(1.8v/3.3v_Input)",
+            "power_in"
+        )));
     }
 
     fn single_unit_schematic(footprint: &str) -> String {
@@ -1902,5 +1958,16 @@ mod review_completion_tests {
             .unwrap()
             .iter()
             .any(|item| item["code"] == "zero_pads"));
+    }
+
+    #[test]
+    fn generic_bulk_warning_is_limited_to_explicit_five_volt_and_higher_rails() {
+        assert!(rail_requires_bulk_capacitance("+5V_SYS"));
+        assert!(rail_requires_bulk_capacitance("+12V_PD"));
+        assert!(rail_requires_bulk_capacitance("24V0_RAW"));
+        assert!(!rail_requires_bulk_capacitance("+3V3_CM4"));
+        assert!(!rail_requires_bulk_capacitance("+1V8"));
+        assert!(!rail_requires_bulk_capacitance("VCC"));
+        assert!(!rail_requires_bulk_capacitance("GPIO_VREF"));
     }
 }

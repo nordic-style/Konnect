@@ -256,9 +256,11 @@ pub fn any_type_name(item: &prost_types::Any) -> &str {
 fn stroke(width_mm: f64) -> kiapi::common::types::StrokeAttributes {
     kiapi::common::types::StrokeAttributes {
         width: Some(distance(width_mm)),
-        // ponytail: leave style/color at proto default (solid, board default color).
-        // Add args when a caller needs dashed/colored graphics.
-        style: 0,
+        // KiCad distinguishes UNKNOWN/DEFAULT from an explicit solid stroke in
+        // library-parity checks, most visibly for zero-width filled polygons
+        // such as NetTie copper bridges.  Library graphics default to `solid`,
+        // so emit that exact enum instead of relying on proto zero values.
+        style: kiapi::common::types::StrokeLineStyle::SlsSolid as i32,
         color: None,
     }
 }
@@ -654,9 +656,14 @@ pub(crate) mod tests {
         let s = board_polygon("F.SilkS", 0.0, true, &outlines);
         assert_eq!(s.layer, kiapi::board::types::BoardLayer::BlFSilkS as i32);
         let shape = s.shape.expect("shape");
+        let attributes = shape.attributes.unwrap();
         assert_eq!(
-            shape.attributes.unwrap().fill.unwrap().fill_type,
+            attributes.fill.unwrap().fill_type,
             kiapi::common::types::GraphicFillType::GftFilled as i32
+        );
+        assert_eq!(
+            attributes.stroke.unwrap().style,
+            kiapi::common::types::StrokeLineStyle::SlsSolid as i32
         );
         match shape.geometry.expect("geometry") {
             Geometry::Polygon(poly_set) => {
