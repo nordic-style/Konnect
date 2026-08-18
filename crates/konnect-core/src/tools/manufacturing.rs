@@ -403,12 +403,10 @@ async fn handle_validate_for_manufacturing(
         }));
     }
 
-    // Check layer count
-    let _layers = tree
-        .find("layers")
-        .map(|l| l.find_all("*"))
-        .unwrap_or_default();
-    let copper_layers = content.matches("signal)").count() + content.matches("signal \"").count();
+    // Copper is identified by the canonical `.Cu` layer name. KiCad also
+    // permits `power`, `mixed`, and `jumper` layer kinds; counting only the
+    // word `signal` silently under-reports those plane layers.
+    let copper_layers = count_copper_layers(&tree);
     debug!(
         copper_layers = copper_layers,
         "[BETA] Detected copper layers"
@@ -546,10 +544,10 @@ async fn handle_estimate_cost(
     let component_count = fps.len();
 
     // Detect layers
-    let copper_layers = args["layers"].as_u64().unwrap_or_else(|| {
-        let count = content.matches("signal)").count() + content.matches("signal \"").count();
-        (count as u64).max(2)
-    }) as usize;
+    let copper_layers = args["layers"]
+        .as_u64()
+        .unwrap_or_else(|| (count_copper_layers(&tree) as u64).max(2))
+        as usize;
 
     // Estimate board dimensions from Edge.Cuts
     let (width_mm, height_mm) = estimate_board_dimensions(&content);
@@ -704,6 +702,11 @@ mod package_export_option_tests {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+fn count_copper_layers(tree: &konnect_sexp::SexpNode) -> usize {
+    let stack = konnect_sexp::layers::layers(tree);
+    konnect_sexp::layers::copper(&stack).len()
+}
 
 /// Distinct nets and routed items on the board, read from the parsed tree.
 ///
@@ -879,6 +882,23 @@ mod net_track_count_tests {
     fn counts_a_kicad_9_board_without_double_counting_declarations() {
         let tree = parse_sexp(KICAD_9_BOARD).unwrap();
         assert_eq!(count_nets_and_tracks(&tree), (2, 4));
+    }
+
+    #[test]
+    fn copper_layer_count_includes_power_mixed_and_jumper_planes() {
+        let tree = parse_sexp(
+            r#"(kicad_pcb
+                (layers
+                    (0 "F.Cu" signal)
+                    (4 "In1.Cu" power)
+                    (6 "In2.Cu" mixed)
+                    (8 "In3.Cu" jumper)
+                    (2 "B.Cu" signal)
+                    (9 "F.Adhes" user)))"#,
+        )
+        .unwrap();
+
+        assert_eq!(count_copper_layers(&tree), 5);
     }
 
     #[test]
