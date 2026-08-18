@@ -59,9 +59,22 @@ pub struct DrcViolation {
     /// alone is not addressable.
     pub rule: String,
     /// Where to look. KiCad reports one position per *involved item*, not one
-    /// per violation, so this is the first item's — which is what the report
-    /// used to try to read from a top-level `pos` field that does not exist,
-    /// making every position `null`.
+    /// per violation in the original v1 schema, so this falls back to the
+    /// first item's position. Newer KiCad builds also report the DRC marker's
+    /// exact top-level `pos`, including for item-less geometry checks.
+    pub pos: Option<ErcPos>,
+    /// Marker layer, when KiCad can associate the violation with one.
+    pub layer: Option<String>,
+    /// Every board item KiCad associated with the violation. Keeping the item
+    /// UUID and description is essential when two different objects share the
+    /// same reported position (notably circular board edges).
+    pub items: Vec<DrcItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DrcItem {
+    pub description: String,
+    pub uuid: String,
     pub pos: Option<ErcPos>,
 }
 
@@ -286,21 +299,43 @@ fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
             raw.get(key)?
                 .as_array()?
                 .iter()
-                .map(|v| DrcViolation {
-                    severity: v["severity"].as_str().unwrap_or("error").to_string(),
-                    description: v["description"].as_str().unwrap_or("").to_string(),
-                    rule: v["type"].as_str().unwrap_or("").to_string(),
-                    // The position lives on each involved item; a violation has
-                    // no `pos` of its own.
-                    pos: v["items"].as_array().and_then(|items| {
-                        items.iter().find_map(|item| {
-                            let p = item.get("pos")?;
-                            Some(ErcPos {
-                                x: p["x"].as_f64()?,
-                                y: p["y"].as_f64()?,
-                            })
+                .map(|v| {
+                    let items = v["items"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|item| DrcItem {
+                            description: item["description"].as_str().unwrap_or("").to_string(),
+                            uuid: item["uuid"].as_str().unwrap_or("").to_string(),
+                            pos: item.get("pos").and_then(|p| {
+                                Some(ErcPos {
+                                    x: p["x"].as_f64()?,
+                                    y: p["y"].as_f64()?,
+                                })
+                            }),
                         })
-                    }),
+                        .collect::<Vec<_>>();
+                    DrcViolation {
+                        severity: v["severity"].as_str().unwrap_or("error").to_string(),
+                        description: v["description"].as_str().unwrap_or("").to_string(),
+                        rule: v["type"].as_str().unwrap_or("").to_string(),
+                        // Prefer the marker's exact position when the producer
+                        // provides it, then remain compatible with older reports.
+                        pos: v
+                            .get("pos")
+                            .and_then(|p| {
+                                Some(ErcPos {
+                                    x: p["x"].as_f64()?,
+                                    y: p["y"].as_f64()?,
+                                })
+                            })
+                            .or_else(|| items.iter().find_map(|item| item.pos.clone())),
+                        layer: v
+                            .get("layer")
+                            .and_then(|layer| layer.as_str())
+                            .map(String::from),
+                        items,
+                    }
                 })
                 .collect(),
         )
@@ -1195,10 +1230,9 @@ mod drc_parse_tests {
             .all(|v| v.severity == "error"));
     }
 
-    /// KiCad reports a position per *involved item*, not one per violation.
-    /// Reading a top-level `pos` — which the schema has never had — made every
-    /// position `null`, and the rule key was dropped entirely, leaving the
-    /// caller with prose they cannot act on.
+    /// Older KiCad reports a position per *involved item*, not one per
+    /// violation. Konnect must retain that fallback while also accepting the
+    /// exact marker position added by newer producers.
     #[test]
     fn a_violation_carries_its_rule_key_and_a_real_position() {
         let report = parse_drc_report(&real_report()).unwrap();
@@ -1213,10 +1247,40 @@ mod drc_parse_tests {
             .as_ref()
             .expect("position comes from items[0].pos");
         assert!(pos.x != 0.0 || pos.y != 0.0);
+        assert!(!first.items.is_empty());
+        assert!(first.items.iter().any(|item| !item.uuid.is_empty()));
+        assert!(first.items.iter().any(|item| !item.description.is_empty()));
 
         let unconnected = &report.unconnected_items.as_ref().unwrap()[0];
         assert_eq!(unconnected.rule, "unconnected_items");
         assert!(unconnected.pos.is_some());
+    }
+
+    #[test]
+    fn an_itemless_violation_uses_the_exact_marker_position_and_layer() {
+        let report = parse_drc_report(&serde_json::json!({
+            "violations": [
+                {
+                    "description": "Copper sliver (F.Cu)",
+                    "items": [],
+                    "layer": "F.Cu",
+                    "pos": { "x": 123.456, "y": 78.9 },
+                    "severity": "warning",
+                    "type": "copper_sliver"
+                }
+            ],
+            "unconnected_items": [],
+            "schematic_parity": []
+        }))
+        .unwrap();
+
+        let sliver = &report.violations[0];
+        assert!(sliver.items.is_empty());
+        assert_eq!(sliver.layer.as_deref(), Some("F.Cu"));
+        assert_eq!(
+            sliver.pos.as_ref().map(|pos| (pos.x, pos.y)),
+            Some((123.456, 78.9))
+        );
     }
 
     /// A report missing `violations` is not a DRC report. Defaulting it to an
