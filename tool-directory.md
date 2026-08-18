@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **19 toolsets** organized into 10 categories
-- **203 registered tools** + **6 always-visible meta-tools** = **209 total**
+- **204 registered tools** + **6 always-visible meta-tools** = **210 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -220,8 +220,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net. Refuses a net the board does not declare rather than binding copper to net 0, and refuses entirely while KiCad holds the board open. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
-### `pcb_components` · 17 tools
-**Purpose:** Place, move, rotate, flip, align and duplicate PCB footprints; inspect pads; inspect and edit a placed footprint's graphics.
+### `pcb_components` · 18 tools
+**Purpose:** Place, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
 | Tool | Description |
@@ -233,6 +233,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `flip_component` | Set a placed footprint to F.Cu or B.Cu on a closed board with KiCAD-equivalent geometry mirroring and revision checks; refuses live-editor races and unsupported geometry. |
 | `delete_component` | Remove a footprint from the board via KiCAD IPC. |
 | `edit_component` | Update the value or other properties of a placed footprint via KiCAD IPC. |
+| `repair_corrupted_footprints` | Dry-run and atomically repair the exact legacy corruption from issue #244: anonymous layerless pads that replaced footprint drawing shapes. Restores the affected shapes from the registered library while preserving live placement, identity, pad nets and non-shape children; apply requires the dry-run revision and is one KiCAD undo commit. |
 | `find_component` | Find a footprint by reference designator and return its position. |
 | `list_board_footprint_graphics` | List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Reports `editable`, plus `outlines` and `holes` for polygons. Requires KiCAD running with the board open. |
 | `edit_board_footprint_graphic` | Replace the vertices of a single-outline polygon inside a placed footprint, selected by UUID, without re-placing the part. Anything with multiple outlines or holes is refused by name rather than flattened. Requires KiCAD running with the board open. |
