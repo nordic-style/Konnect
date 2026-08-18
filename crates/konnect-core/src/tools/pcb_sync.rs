@@ -127,6 +127,8 @@ enum PlannedChange {
         kiid: String,
         reference: String,
         value: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous_symbol_path: Option<String>,
         symbol_path: String,
         dnp: bool,
         pad_nets: BTreeMap<String, String>,
@@ -175,6 +177,9 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     let board = crate::tools::get_path(args, "board")?;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
     let allow_routed_pad_net_changes = args["allow_routed_pad_net_changes"]
+        .as_bool()
+        .unwrap_or(false);
+    let allow_reference_identity_rebind = args["allow_reference_identity_rebind"]
         .as_bool()
         .unwrap_or(false);
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
@@ -258,6 +263,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 &design,
                 &snapshot.state,
                 allow_routed_pad_net_changes,
+                allow_reference_identity_rebind,
             );
             let prepared = match prepare_additions(&library_board, &plan) {
                 Ok(prepared) => prepared,
@@ -409,6 +415,7 @@ fn plan_sync(
     design: &ExportedDesign,
     board: &BoardState,
     allow_routed_pad_net_changes: bool,
+    allow_reference_identity_rebind: bool,
 ) -> SyncPlan {
     let mut diagnostics = Vec::new();
     let mut counts = SyncCounts::default();
@@ -441,6 +448,17 @@ fn plan_sync(
     let mut matched = std::collections::HashSet::new();
     let mut design_references = std::collections::HashSet::new();
     let mut design_paths = std::collections::HashSet::new();
+    let current_design_paths = design
+        .components
+        .iter()
+        .map(|component| component.symbol_path.as_str())
+        .chain(
+            design
+                .skipped
+                .iter()
+                .map(|component| component.symbol_path.as_str()),
+        )
+        .collect::<HashSet<_>>();
     let staging_x = board.bounds.max_x + 10.0;
     let mut add_index = 0usize;
 
@@ -510,6 +528,22 @@ fn plan_sync(
                     .get(component.reference.as_str())
                     .copied()
                     .filter(|index| board.footprints[*index].symbol_path.is_none())
+            })
+            .or_else(|| {
+                if !allow_reference_identity_rebind {
+                    return None;
+                }
+                board_by_reference
+                    .get(component.reference.as_str())
+                    .copied()
+                    .filter(|index| {
+                        let footprint = &board.footprints[*index];
+                        !footprint.not_in_schematic
+                            && footprint
+                                .symbol_path
+                                .as_deref()
+                                .is_some_and(|path| !current_design_paths.contains(path))
+                    })
             });
 
         let Some(index) = matched_index else {
@@ -653,6 +687,11 @@ fn plan_sync(
                 kiid: footprint.kiid.clone(),
                 reference: component.reference.clone(),
                 value: component.value.clone(),
+                previous_symbol_path: footprint
+                    .symbol_path
+                    .as_ref()
+                    .filter(|path| path.as_str() != component.symbol_path)
+                    .cloned(),
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
                 pad_nets: component.pad_nets.clone(),
@@ -1796,8 +1835,8 @@ mod tests {
             },
         };
 
-        let first = plan_sync("netlist bytes", &design, &board, false);
-        let second = plan_sync("netlist bytes", &design, &board, false);
+        let first = plan_sync("netlist bytes", &design, &board, false, false);
+        let second = plan_sync("netlist bytes", &design, &board, false, false);
 
         assert_eq!(first.status, PlanStatus::Ready);
         assert_eq!(first.plan_revision, second.plan_revision);
@@ -1949,6 +1988,7 @@ mod tests {
             kiid: "u1-kiid".to_string(),
             reference: "U1".to_string(),
             value: "NE555".to_string(),
+            previous_symbol_path: None,
             symbol_path: "/root/u1".to_string(),
             dnp: false,
             pad_nets: BTreeMap::from([("1".to_string(), "GND".to_string())]),
@@ -2147,6 +2187,7 @@ mod tests {
             kiid: "keep-kiid".to_string(),
             reference: "R2".to_string(),
             value: "10k".to_string(),
+            previous_symbol_path: None,
             symbol_path: "/root/symbol".to_string(),
             dnp: true,
             pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
@@ -2215,7 +2256,7 @@ mod tests {
             },
         };
 
-        let plan = plan_sync("netlist", &design, &board, false);
+        let plan = plan_sync("netlist", &design, &board, false, false);
 
         assert_eq!(plan.status, PlanStatus::Conflict);
         assert!(plan.changes.is_empty());
@@ -2224,7 +2265,7 @@ mod tests {
             .iter()
             .any(|diagnostic| diagnostic.code == "routed_pad_net_change"));
 
-        let authorized = plan_sync("netlist", &design, &board, true);
+        let authorized = plan_sync("netlist", &design, &board, true, false);
         assert_eq!(authorized.status, PlanStatus::Ready);
         assert_eq!(authorized.counts.pads_reassigned.planned, 1);
         assert!(!authorized
@@ -2244,11 +2285,71 @@ mod tests {
             &design,
             &board_with(vec![board_resistor("R1", Some("/sheet/existing"))]),
             false,
+            false,
         );
 
         assert_eq!(plan.status, PlanStatus::Noop);
         assert!(plan.changes.is_empty());
         assert_eq!(plan.counts.conflicts.planned, 0);
+    }
+
+    #[test]
+    fn stale_reference_identity_requires_an_explicit_safe_rebind() {
+        let design = ExportedDesign {
+            components: vec![resistor("R1", "/current/r1")],
+            skipped: Vec::new(),
+        };
+        let mut footprint = board_resistor("R1", Some("/stale/r1"));
+        footprint.position = Point { x: 25.0, y: 30.0 };
+        footprint.rotation = 90.0;
+        footprint.layer = "B.Cu".to_string();
+        footprint.locked = true;
+        let board = board_with(vec![footprint]);
+
+        let refused = plan_sync("netlist", &design, &board, false, false);
+        assert_eq!(refused.status, PlanStatus::Conflict);
+        assert!(refused
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "reference_identity_conflict"));
+
+        let allowed = plan_sync("netlist", &design, &board, false, true);
+        assert_eq!(allowed.status, PlanStatus::Ready);
+        assert_eq!(allowed.counts.updated.planned, 1);
+        assert_eq!(allowed.counts.pads_reassigned.planned, 0);
+        assert!(matches!(
+            allowed.changes.as_slice(),
+            [PlannedChange::Update {
+                reference,
+                previous_symbol_path: Some(previous),
+                symbol_path,
+                preserve,
+                ..
+            }] if reference == "R1"
+                && previous == "/stale/r1"
+                && symbol_path == "/current/r1"
+                && preserve.position == Point { x: 25.0, y: 30.0 }
+                && preserve.rotation == 90.0
+                && preserve.layer == "B.Cu"
+                && preserve.locked
+        ));
+    }
+
+    #[test]
+    fn identity_rebind_refuses_a_stale_path_still_owned_by_the_design() {
+        let design = ExportedDesign {
+            components: vec![resistor("R1", "/current/r1"), resistor("R2", "/stale/r1")],
+            skipped: Vec::new(),
+        };
+        let board = board_with(vec![board_resistor("R1", Some("/stale/r1"))]);
+
+        let plan = plan_sync("netlist", &design, &board, false, true);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        assert!(plan.changes.is_empty());
+        assert!(plan
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "reference_identity_conflict"));
     }
 
     #[test]
@@ -2259,7 +2360,13 @@ mod tests {
         };
         let mut footprint = board_resistor("R1", Some("/sheet/existing"));
         footprint.footprint_id = "Resistor_SMD:R_0805_2012Metric".to_string();
-        let swap = plan_sync("netlist", &design, &board_with(vec![footprint]), false);
+        let swap = plan_sync(
+            "netlist",
+            &design,
+            &board_with(vec![footprint]),
+            false,
+            false,
+        );
         assert_eq!(swap.status, PlanStatus::Conflict);
         assert!(swap
             .diagnostics
@@ -2270,7 +2377,13 @@ mod tests {
         footprint
             .pad_nets
             .insert("1".to_string(), "OLD_VCC".to_string());
-        let net_change = plan_sync("netlist", &design, &board_with(vec![footprint]), false);
+        let net_change = plan_sync(
+            "netlist",
+            &design,
+            &board_with(vec![footprint]),
+            false,
+            false,
+        );
         assert_eq!(net_change.status, PlanStatus::Ready);
         assert_eq!(net_change.counts.pads_reassigned.planned, 1);
     }
@@ -2284,7 +2397,7 @@ mod tests {
                 symbol_path: "/sheet/existing".to_string(),
             }],
         };
-        let absent = plan_sync("netlist", &design, &board_with(Vec::new()), false);
+        let absent = plan_sync("netlist", &design, &board_with(Vec::new()), false, false);
         assert_eq!(absent.status, PlanStatus::Noop);
         assert_eq!(absent.counts.skipped_by_flag.planned, 1);
 
@@ -2292,6 +2405,7 @@ mod tests {
             "netlist",
             &design,
             &board_with(vec![board_resistor("R1", Some("/sheet/existing"))]),
+            false,
             false,
         );
         assert_eq!(present.status, PlanStatus::Conflict);
@@ -2311,6 +2425,7 @@ mod tests {
             "netlist",
             &design,
             &board_with(vec![board_resistor("R1", None)]),
+            false,
             false,
         );
 
@@ -2350,10 +2465,10 @@ mod tests {
             components: vec![resistor("R1", "/sheet/new")],
             skipped: Vec::new(),
         };
-        let first = plan_sync("netlist", &design, &board_with(Vec::new()), false);
+        let first = plan_sync("netlist", &design, &board_with(Vec::new()), false, false);
         let mut changed_board = board_with(Vec::new());
         changed_board.bounds.max_x = 11.0;
-        let second = plan_sync("netlist", &design, &changed_board, false);
+        let second = plan_sync("netlist", &design, &changed_board, false, false);
 
         assert_ne!(first.plan_revision, second.plan_revision);
     }

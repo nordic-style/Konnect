@@ -138,6 +138,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "Explicitly allow pad-net reassignment even when either net has routed copper. Use only after checking that no track or via is attached to the affected pad; refill zones after apply.",
                         "default": false
                     },
+                    "allow_reference_identity_rebind": {
+                        "type": "boolean",
+                        "description": "Explicitly rebind a uniquely matching board reference from a stale schematic identity to the current saved symbol identity. The footprint library ID must still match, its prior identity must not exist in the current schematic, and placement/routing are preserved.",
+                        "default": false
+                    },
                     "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" }
                 },
                 "required": ["schematic", "board"]

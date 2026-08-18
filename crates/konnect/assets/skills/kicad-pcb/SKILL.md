@@ -72,6 +72,11 @@ Follow this sequence for a clean PCB workflow:
    schematic editor, and the target board must be open in KiCad. A conflict is
    non-mutating; resolve it and rerun the dry run. A successful apply is one KiCad
    undo entry, so Ctrl-Z reverses the whole update.
+   If a board was routed from an older copy of the schematic and only the saved symbol
+   identities changed, inspect the conflicting references and repeat the dry run with
+   `allow_reference_identity_rebind: true`. This opt-in only accepts unique references
+   whose previous identity no longer exists in the saved design and whose footprint
+   library ID still matches; the plan exposes the previous and replacement paths.
 3. **Place components** — position all footprints
 4. **Route traces** — connect all nets
 5. **Copper pour** — add ground/power zones last
