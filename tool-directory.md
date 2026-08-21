@@ -178,7 +178,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. Routed pad-net reassignment remains blocked unless `allow_routed_pad_net_changes` is explicitly enabled after a local copper check. A uniquely matching reference carrying an obsolete schematic identity remains blocked unless `allow_reference_identity_rebind` is explicitly enabled; the prior identity must be absent from the current design and the footprint library ID must still match. |
-| `get_schematic_view` | Render the schematic through kicad-cli and verify the generated SVG output. |
+| `get_schematic_view` | Render a sheet with kicad-cli and return the verified SVG path. There is no schematic PNG renderer; the bounded temporary slot is reused for subsequent views of the same sheet. |
 
 ### `sch_hierarchy` · 12 tools
 **Purpose:** Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
