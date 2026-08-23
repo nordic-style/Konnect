@@ -430,6 +430,17 @@ pub struct SchematicSvgOptions<'a> {
     pub theme: Option<&'a str>,
 }
 
+/// Every SVG emitted for one schematic export.
+///
+/// KiCad writes one file per hierarchical sheet. `root` is kept separately
+/// for callers that need the conventional top-level drawing, while `files`
+/// contains that root first followed by every child sheet in stable order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchematicSvgExport {
+    pub root: PathBuf,
+    pub files: Vec<PathBuf>,
+}
+
 fn schematic_svg_args<'a>(
     output_dir: &'a str,
     schematic: &'a str,
@@ -447,24 +458,205 @@ fn schematic_svg_args<'a>(
     args
 }
 
+fn output_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn schematic_svg_destination(
+    generated: &Path,
+    schematic_stem: &str,
+    requested_output: &Path,
+) -> Result<PathBuf> {
+    let generated_stem = generated
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .with_context(|| {
+            format!(
+                "KiCad produced an invalid SVG name: {}",
+                generated.display()
+            )
+        })?;
+
+    if generated_stem == schematic_stem {
+        return Ok(requested_output.to_path_buf());
+    }
+
+    let suffix = generated_stem
+        .strip_prefix(schematic_stem)
+        .filter(|suffix| suffix.starts_with('-') && suffix.len() > 1)
+        .with_context(|| {
+            format!(
+                "KiCad produced an unexpected schematic SVG name: {}",
+                generated.display()
+            )
+        })?;
+    let requested_stem = requested_output
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .with_context(|| {
+            format!(
+                "schematic SVG output must include a valid filename: {}",
+                requested_output.display()
+            )
+        })?;
+    let requested_extension = requested_output
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .with_context(|| {
+            format!(
+                "schematic SVG output must end in .svg: {}",
+                requested_output.display()
+            )
+        })?;
+
+    let filename = format!("{requested_stem}{suffix}.{requested_extension}");
+    Ok(requested_output
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(filename))
+}
+
+async fn publish_schematic_svgs(
+    staging_dir: &Path,
+    schematic: &Path,
+    requested_output: &Path,
+) -> Result<SchematicSvgExport> {
+    let requested_extension = requested_output
+        .extension()
+        .and_then(|extension| extension.to_str());
+    if !requested_extension.is_some_and(|extension| extension.eq_ignore_ascii_case("svg")) {
+        anyhow::bail!(
+            "schematic SVG output must end in .svg: {}",
+            requested_output.display()
+        );
+    }
+
+    let schematic_stem = schematic
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .with_context(|| {
+            format!(
+                "schematic path must include a valid filename: {}",
+                schematic.display()
+            )
+        })?;
+    let mut generated = Vec::new();
+    let mut entries = tokio::fs::read_dir(staging_dir).await.with_context(|| {
+        format!(
+            "failed to inspect schematic SVG export directory {}",
+            staging_dir.display()
+        )
+    })?;
+
+    while let Some(entry) = entries.next_entry().await? {
+        let source = entry.path();
+        if !entry.file_type().await?.is_file()
+            || !source
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+        {
+            continue;
+        }
+
+        verify_nonempty_file(&source, "schematic SVG").await?;
+        let destination = schematic_svg_destination(&source, schematic_stem, requested_output)?;
+        generated.push((source, destination));
+    }
+
+    if generated.is_empty() {
+        anyhow::bail!(
+            "schematic SVG export reported success but did not create any SVG files in {}",
+            staging_dir.display()
+        );
+    }
+    if !generated
+        .iter()
+        .any(|(_, destination)| destination == requested_output)
+    {
+        anyhow::bail!(
+            "schematic SVG export did not create the root sheet {}.svg",
+            schematic_stem
+        );
+    }
+
+    generated.sort_by(|left, right| {
+        let left_is_root = left.1 == requested_output;
+        let right_is_root = right.1 == requested_output;
+        right_is_root
+            .cmp(&left_is_root)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+
+    // Validate the complete generated set before replacing any requested
+    // artifact. An empty child sheet must not overwrite a previously useful
+    // root export and then report a partial success.
+    let mut published = Vec::with_capacity(generated.len());
+    for (source, destination) in generated {
+        tokio::fs::copy(&source, &destination)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to publish schematic SVG {} as {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        verify_nonempty_file(&destination, "schematic SVG").await?;
+        published.push(destination);
+    }
+
+    Ok(SchematicSvgExport {
+        root: requested_output.to_path_buf(),
+        files: published,
+    })
+}
+
 /// KiCAD 10: `sch export svg --output <dir> [--black-and-white]
-/// [--theme <name>] <input>`
+/// [--theme <name>] <input>`.
+///
+/// The CLI writes one SVG per hierarchical sheet and derives every filename
+/// from the input schematic. Konnect exports into a fresh staging directory,
+/// verifies every file, then substitutes the caller's requested stem across
+/// the complete set before reporting it.
 pub async fn export_schematic_svg(
     cli: &str,
     schematic: &Path,
-    output_dir: &Path,
+    output: &Path,
     options: &SchematicSvgOptions<'_>,
-) -> Result<PathBuf> {
+) -> Result<SchematicSvgExport> {
+    let output_dir = output_parent(output);
+    tokio::fs::create_dir_all(output_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create SVG output directory {}",
+                output_dir.display()
+            )
+        })?;
+    let staging_dir = tempfile::Builder::new()
+        .prefix(".konnect-svg-export-")
+        .tempdir_in(output_dir)
+        .with_context(|| {
+            format!(
+                "failed to create a temporary SVG export directory in {}",
+                output_dir.display()
+            )
+        })?;
     let args = schematic_svg_args(
-        output_dir.to_str().unwrap(),
-        schematic.to_str().unwrap(),
+        staging_dir
+            .path()
+            .to_str()
+            .context("temporary SVG export path is not valid UTF-8")?,
+        schematic
+            .to_str()
+            .context("schematic path is not valid UTF-8")?,
         options,
     );
     run_cli(cli, &args, LONG_TIMEOUT).await?;
-    let stem = schematic.file_stem().unwrap_or_default().to_string_lossy();
-    let output = output_dir.join(format!("{}.svg", stem));
-    verify_nonempty_file(&output, "schematic SVG").await?;
-    Ok(output)
+    publish_schematic_svgs(staging_dir.path(), schematic, output).await
 }
 
 #[derive(Debug, Clone)]
@@ -1020,11 +1212,24 @@ pub async fn export_odb(
 
 // ─── Render to image ─────────────────────────────────────────────────────────
 
-/// Render schematic to SVG (no bitmap export in KiCAD 10 CLI).
-/// KiCAD 10: `sch export svg --output <dir> <input>`
-pub async fn render_schematic_svg(cli: &str, schematic: &Path, output: &Path) -> Result<PathBuf> {
-    let output_dir = output.parent().unwrap_or(Path::new("."));
-    export_schematic_svg(cli, schematic, output_dir, &SchematicSvgOptions::default()).await
+/// Render a schematic hierarchy to verified SVG files (no bitmap export in
+/// KiCAD 10 CLI). The root sheet keeps the schematic stem in `output_dir`.
+pub async fn render_schematic_svg(
+    cli: &str,
+    schematic: &Path,
+    output_dir: &Path,
+) -> Result<SchematicSvgExport> {
+    let stem = schematic
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .with_context(|| {
+            format!(
+                "schematic path must include a valid filename: {}",
+                schematic.display()
+            )
+        })?;
+    let output = output_dir.join(format!("{stem}.svg"));
+    export_schematic_svg(cli, schematic, &output, &SchematicSvgOptions::default()).await
 }
 
 /// KiCAD 10: `pcb render --output <path> --width <w> --height <h> <input>`
@@ -1106,6 +1311,79 @@ mod schematic_export_option_tests {
         let pdf = schematic_pdf_args("/out/design.pdf", "/tmp/design.kicad_sch", &pdf_options);
         assert!(!pdf.contains(&"--black-and-white"));
         assert!(!pdf.contains(&"--pages"));
+    }
+
+    #[tokio::test]
+    async fn hierarchical_svg_export_renames_verifies_and_reports_every_sheet() {
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(
+            staging.path().join("pic_programmer.svg"),
+            b"<svg>root</svg>",
+        )
+        .unwrap();
+        std::fs::write(
+            staging.path().join("pic_programmer-pic_sockets.svg"),
+            b"<svg>child</svg>",
+        )
+        .unwrap();
+
+        let destination = tempfile::tempdir().unwrap();
+        let output = destination.path().join("MyBoard.svg");
+        let export = publish_schematic_svgs(
+            staging.path(),
+            Path::new("/project/pic_programmer.kicad_sch"),
+            &output,
+        )
+        .await
+        .unwrap();
+
+        let child = destination.path().join("MyBoard-pic_sockets.svg");
+        assert_eq!(export.root, output);
+        assert_eq!(export.files, vec![output.clone(), child.clone()]);
+        assert_eq!(std::fs::read(&output).unwrap(), b"<svg>root</svg>");
+        assert_eq!(std::fs::read(&child).unwrap(), b"<svg>child</svg>");
+    }
+
+    #[tokio::test]
+    async fn an_empty_child_rejects_the_set_before_overwriting_the_root() {
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(staging.path().join("design.svg"), b"<svg>new</svg>").unwrap();
+        std::fs::write(staging.path().join("design-empty.svg"), []).unwrap();
+
+        let destination = tempfile::tempdir().unwrap();
+        let output = destination.path().join("requested.svg");
+        std::fs::write(&output, b"<svg>previous</svg>").unwrap();
+
+        let error = publish_schematic_svgs(
+            staging.path(),
+            Path::new("/project/design.kicad_sch"),
+            &output,
+        )
+        .await
+        .expect_err("an empty child sheet must fail the complete export");
+
+        assert!(error.to_string().contains("empty file"), "{error:#}");
+        assert_eq!(std::fs::read(&output).unwrap(), b"<svg>previous</svg>");
+    }
+
+    #[tokio::test]
+    async fn a_child_without_the_root_is_not_a_successful_export() {
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(staging.path().join("design-child.svg"), b"<svg>child</svg>").unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let output = destination.path().join("requested.svg");
+
+        let error = publish_schematic_svgs(
+            staging.path(),
+            Path::new("/project/design.kicad_sch"),
+            &output,
+        )
+        .await
+        .expect_err("the root sheet is required");
+
+        assert!(error.to_string().contains("root sheet"), "{error:#}");
+        assert!(!output.exists());
+        assert!(!destination.path().join("requested-child.svg").exists());
     }
 }
 

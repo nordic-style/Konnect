@@ -28,12 +28,17 @@ pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
             "export_schematic_svg",
-            "Export a schematic sheet to an SVG file using kicad-cli. The result doubles as a              machine-readable geometry source: kicad-cli writes every string twice — visibly as              stroke paths, and again as an invisible <text opacity=\"0\"> element carrying x, y,              textLength, font-size and text-anchor — so text content, position and width are              checkable without rendering a pixel.",
+            "Export a schematic hierarchy to verified SVG files using kicad-cli. The requested \
+             filename is used for the root sheet and every child sheet is returned in files. The \
+             result doubles as a machine-readable geometry source: kicad-cli writes every string \
+             twice — visibly as stroke paths, and again as an invisible <text opacity=\"0\"> \
+             element carrying x, y, textLength, font-size and text-anchor — so text content, \
+             position and width are checkable without rendering a pixel.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
-                    "output":    { "type": "string", "description": "Output SVG file path (directory used as output dir)" },
+                    "output":    { "type": "string", "description": "Output path for the root SVG; child sheets reuse this filename stem" },
                     "black_and_white": { "type": "boolean", "description": "Render in black and white", "default": false },
                     "theme": { "type": "string", "description": "KiCad colour theme name (optional)" }
                 },
@@ -153,7 +158,7 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "get_schematic_view",
-            "Render a schematic sheet with kicad-cli and return the path to the SVG it wrote. \
+            "Render a schematic hierarchy with kicad-cli and return every verified SVG it wrote. \
              There is no PNG: KiCad ships no schematic rasteriser, so this is a vector file \
              rather than an inline bitmap. The file lands in a stable temporary slot and is \
              overwritten by the next view of the same sheet; use export_schematic_svg to \
@@ -197,13 +202,25 @@ async fn handle_get_schematic_view(
 
     // KiCad has no schematic rasteriser. Keep the verified SVG so the caller
     // can actually inspect the artifact instead of receiving only its length.
-    let svg_path = cli::render_schematic_svg(&ctx.config.kicad_cli, &sch_path, &out_dir).await?;
-    let bytes = tokio::fs::metadata(&svg_path).await?.len();
+    let export = cli::render_schematic_svg(&ctx.config.kicad_cli, &sch_path, &out_dir).await?;
+    let bytes = tokio::fs::metadata(&export.root).await?.len();
+    let mut total_bytes = 0;
+    for path in &export.files {
+        total_bytes += tokio::fs::metadata(path).await?.len();
+    }
+    let files = export
+        .files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
 
     Ok(CallToolResult::json(&json!({
         "schematic": sch_path.display().to_string(),
-        "svg": svg_path.display().to_string(),
+        "svg": export.root.display().to_string(),
+        "files": files,
+        "sheet_count": export.files.len(),
         "bytes": bytes,
+        "total_bytes": total_bytes,
         "format": "svg"
     })))
 }
@@ -219,18 +236,18 @@ async fn handle_export_svg(
         theme: args["theme"].as_str(),
     };
 
-    // kicad-cli writes to an output directory and names the file <stem>.svg
-    let output_dir = output_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .to_path_buf();
-    std::fs::create_dir_all(&output_dir)?;
-
-    let svg_path =
-        cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_dir, &options).await?;
+    let export =
+        cli::export_schematic_svg(&ctx.config.kicad_cli, &sch_path, &output_path, &options).await?;
+    let files = export
+        .files
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>();
 
     Ok(CallToolResult::json(&json!({
-        "exported": svg_path.display().to_string(),
+        "exported": export.root.display().to_string(),
+        "files": files,
+        "sheet_count": export.files.len(),
         "black_and_white": options.black_and_white,
         "theme": options.theme
     })))
