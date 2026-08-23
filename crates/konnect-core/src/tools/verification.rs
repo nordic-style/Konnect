@@ -47,12 +47,13 @@ pub fn tools() -> Vec<ToolDef> {
         ),
         tool!(
             "set_design_rules",
-            "Set board-level design rules (clearance, trace width, via size) in the sibling KiCAD project file.",
+            "Set board-level design rules (copper/edge clearance, trace width, via size) in the sibling KiCAD project file.",
             json!({
                 "type": "object",
                 "properties": {
                     "board": { "type": "string", "description": "Path to .kicad_pcb file" },
                     "min_clearance": { "type": "number", "description": "Minimum clearance in mm" },
+                    "min_copper_edge_clearance": { "type": "number", "description": "Minimum copper-to-board-edge clearance in mm" },
                     "min_trace_width": { "type": "number", "description": "Minimum trace width in mm" },
                     "min_via_drill": { "type": "number", "description": "Minimum via drill diameter in mm" },
                     "min_via_size": { "type": "number", "description": "Minimum via pad diameter in mm" },
@@ -373,6 +374,7 @@ async fn handle_set_design_rules(
 
     let rules: &[(&str, &str)] = &[
         ("min_clearance", "min_clearance"),
+        ("min_copper_edge_clearance", "min_copper_edge_clearance"),
         ("min_track_width", "min_trace_width"),
         ("min_through_hole_diameter", "min_via_drill"),
         ("min_via_size", "min_via_size"),
@@ -423,6 +425,7 @@ async fn handle_get_design_rules(
             "project": project_path.to_str().unwrap_or(""),
             "rules": {
                 "min_clearance": project_rule_value(&project, "min_clearance"),
+                "min_copper_edge_clearance": project_rule_value(&project, "min_copper_edge_clearance"),
                 "min_trace_width": project_rule_value(&project, "min_track_width"),
                 "min_via_drill": project_rule_value(&project, "min_through_hole_diameter"),
                 "min_via_size": project_rule_value(&project, "min_via_diameter"),
@@ -1091,6 +1094,7 @@ mod tests {
         let args = json!({
             "board": board,
             "min_clearance": 0.25,
+            "min_copper_edge_clearance": 0.20,
             "min_trace_width": 0.25,
             "min_via_drill": 0.30,
             "min_via_size": 0.70,
@@ -1104,6 +1108,7 @@ mod tests {
             serde_json::from_slice(&tokio::fs::read(&project).await.unwrap()).unwrap();
         let rules = &project_json["board"]["design_settings"]["rules"];
         assert_eq!(rules["min_clearance"], 0.25);
+        assert_eq!(rules["min_copper_edge_clearance"], 0.20);
         assert_eq!(rules["min_track_width"], 0.25);
         assert_eq!(rules["min_through_hole_diameter"], 0.30);
         assert_eq!(rules["min_via_diameter"], 0.70);

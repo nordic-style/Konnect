@@ -49,6 +49,11 @@ pub fn tools() -> Vec<ToolDef> {
                         "type": "string",
                         "description": "Comma-separated fields whose matching references collapse into one BOM row, e.g. 'Value,Footprint'."
                     },
+                    "exclude_dnp": {
+                        "type": "boolean",
+                        "description": "Exclude native KiCad Do-Not-Populate symbols from the assembly BOM.",
+                        "default": true
+                    },
                     "gerber_layers": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -261,7 +266,7 @@ async fn handle_export_manufacturing_package(
                 fields: args["bom_fields"].as_str(),
                 labels: args["bom_labels"].as_str(),
                 group_by: args["bom_group_by"].as_str(),
-                ..Default::default()
+                exclude_dnp: args["exclude_dnp"].as_bool().unwrap_or(true),
             };
             match cli::export_bom(cli_path, sch, &bom_path, &bom_options).await {
                 Ok(()) => {
@@ -646,6 +651,7 @@ mod package_export_option_tests {
             properties["position_side"]["enum"],
             json!(["front", "back", "both"])
         );
+        assert_eq!(properties["exclude_dnp"]["default"], true);
     }
 
     #[cfg(unix)]

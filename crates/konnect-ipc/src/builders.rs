@@ -7,7 +7,7 @@ use crate::gen::kiapi;
 
 /// Converts millimeters to KiCAD nanometers.
 pub fn mm_to_nm(mm: f64) -> i64 {
-    (mm * 1_000_000.0) as i64
+    (mm * 1_000_000.0).round() as i64
 }
 
 /// Converts KiCAD nanometers to millimeters.
@@ -351,6 +351,23 @@ pub fn board_circle(
     r_mm: f64,
     filled: bool,
 ) -> kiapi::board::types::BoardGraphicShape {
+    board_circle_from_points(layer, width_mm, cx, cy, cx + r_mm, cy, filled)
+}
+
+/// Build a BoardGraphicShape circle from its center and one circumference
+/// point.  KiCad compares that point during library-parity DRC, so footprint
+/// graphics must preserve its transformed direction rather than replacing it
+/// with an arbitrary `center + radius` point.
+#[allow(clippy::too_many_arguments)]
+pub fn board_circle_from_points(
+    layer: &str,
+    width_mm: f64,
+    cx: f64,
+    cy: f64,
+    radius_x: f64,
+    radius_y: f64,
+    filled: bool,
+) -> kiapi::board::types::BoardGraphicShape {
     board_shape(
         layer,
         attrs(width_mm, filled),
@@ -358,7 +375,7 @@ pub fn board_circle(
             kiapi::common::types::GraphicCircleAttributes {
                 center: Some(vec2(cx, cy)),
                 // Point on the circumference -- KiCAD stores this rather than a radius scalar.
-                radius_point: Some(vec2(cx + r_mm, cy)),
+                radius_point: Some(vec2(radius_x, radius_y)),
             },
         ),
     )
@@ -474,6 +491,18 @@ pub fn board_text(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn millimetres_round_to_the_nearest_nanometre() {
+        // Decimal millimetres such as 2.05 are commonly represented just
+        // below their exact binary value. Truncation turned a 2.050000 mm pad
+        // into 2.049999 mm, which KiCad correctly reported as a library
+        // footprint mismatch after an otherwise exact refresh.
+        assert_eq!(mm_to_nm(2.05), 2_050_000);
+        assert_eq!(mm_to_nm(-2.05), -2_050_000);
+        assert_eq!(vec2(2.05, 0.23).x_nm, 2_050_000);
+        assert_eq!(distance(0.15).value_nm, 150_000);
+    }
     use kiapi::common::types::graphic_shape::Geometry;
 
     /// `any_is` compares the whole message name, not a suffix of the URL.

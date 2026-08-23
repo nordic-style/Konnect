@@ -14,7 +14,8 @@ use konnect_sexp::{
         find_lib_symbol, pin_endpoint, read_schematic,
     },
     writer::{
-        apply_edits, find_block_with_leading_whitespace, write_atomic_if_unchanged, SexpEdit,
+        apply_edits, find_block_with_leading_whitespace, new_uuid, write_atomic_if_unchanged,
+        SexpEdit,
     },
 };
 use serde_json::json;
@@ -151,10 +152,47 @@ pub fn tools() -> Vec<ToolDef> {
                 super::pcb_sync::handle_update_pcb_from_schematic(args, ctx).await
             }
         ),
+        tool!(
+            "get_schematic_view",
+            "Render the schematic through kicad-cli and verify the generated SVG output.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" }
+                },
+                "required": ["schematic"]
+            }),
+            |args, ctx| async move { handle_get_schematic_view(args, ctx).await }
+        ),
     ]
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
+
+async fn handle_get_schematic_view(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let tmp_dir = std::env::temp_dir().join(format!("konnect_{}", new_uuid()));
+    tokio::fs::create_dir_all(&tmp_dir).await?;
+
+    // KiCAD 10 CLI only supports SVG export for schematics (no bitmap).
+    let svg_path = cli::render_schematic_svg(&ctx.config.kicad_cli, &sch_path, &tmp_dir).await?;
+    let svg_content = tokio::fs::read_to_string(&svg_path).await?;
+    tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+
+    Ok(crate::mcp::protocol::CallToolResult {
+        content: vec![crate::mcp::protocol::ToolContent::Text {
+            text: format!(
+                "SVG schematic rendered. {} bytes.\n\nNote: KiCAD 10 CLI exports schematics as SVG only (no bitmap). \
+                 Use export_schematic_pdf for a PDF version.",
+                svg_content.len()
+            ),
+        }],
+        is_error: false,
+    })
+}
 
 async fn handle_export_svg(
     args: &serde_json::Value,

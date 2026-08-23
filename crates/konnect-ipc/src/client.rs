@@ -1880,6 +1880,40 @@ impl KiCadIpcClient {
                 .map(|graphic| build_graphic_child(graphic, x, y, rotation, back_side))
                 .collect::<Result<Vec<_>>>()?,
         );
+        child_items.extend(
+            fields
+                .properties
+                .iter()
+                .map(|property| {
+                    text_field(
+                        &property.name,
+                        &property.value,
+                        property.at,
+                        property.layer.as_deref(),
+                        property.visible,
+                        property.size,
+                        property.stroke_width,
+                    )
+                    .map(|field| crate::builders::pack_any(&field, "kiapi.board.types.Field"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+        child_items.extend(fields.models.iter().map(|model| {
+            let vector = |value: (f64, f64, f64)| kiapi::common::types::Vector3D {
+                x_nm: value.0,
+                y_nm: value.1,
+                z_nm: value.2,
+            };
+            let model = kiapi::board::types::Footprint3DModel {
+                filename: model.filename.clone(),
+                scale: Some(vector(model.scale)),
+                rotation: Some(vector(model.rotation)),
+                offset: Some(vector(model.offset)),
+                visible: model.visible,
+                opacity: model.opacity,
+            };
+            crate::builders::pack_any(&model, "kiapi.board.types.Footprint3DModel")
+        }));
         let definition = kiapi::board::types::Footprint {
             id: Some(kiapi::common::types::LibraryIdentifier {
                 library_nickname: library_nickname.to_string(),
@@ -2211,11 +2245,11 @@ fn build_graphic_child(
         } => {
             let layer = footprint_child_layer(layer, back_side)?;
             let (cx, cy) = xf(*center);
-            // The radius is rotation-invariant; keep KiCAD's center +
-            // circumference-point encoding by re-deriving it from the length.
-            let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
+            let (radius_x, radius_y) = xf(*end);
             Ok(builders::pack_any(
-                &builders::board_circle(&layer, *width, cx, cy, radius, *filled),
+                &builders::board_circle_from_points(
+                    &layer, *width, cx, cy, radius_x, radius_y, *filled,
+                ),
                 SHAPE,
             ))
         }
@@ -2430,6 +2464,77 @@ mod footprint_graphics_tests {
             .filter(|any| any.type_url.ends_with("BoardText"))
             .map(|any| kiapi::board::types::BoardText::decode(any.value.as_slice()).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn build_preserves_hidden_properties_and_3d_models() {
+        let client = KiCadIpcClient::new("tcp://never-dialed");
+        let fields = crate::types::IpcFieldPlacement {
+            properties: vec![crate::types::IpcPropertyDefinition {
+                name: "KiLib_Generator".to_string(),
+                value: "package/gullwing".to_string(),
+                at: (1.0, 2.0, 0.0),
+                layer: Some("F.SilkS".to_string()),
+                visible: false,
+                size: Some((1.0, 0.9)),
+                stroke_width: Some(0.15),
+            }],
+            models: vec![crate::types::IpcModelDefinition {
+                filename: "${KICAD10_3DMODEL_DIR}/Package_SO.3dshapes/SOIC.step".to_string(),
+                offset: (1.0, 2.0, 3.0),
+                scale: (1.0, 1.1, 1.2),
+                rotation: (10.0, 20.0, 30.0),
+                visible: true,
+                opacity: 0.75,
+            }],
+            ..Default::default()
+        };
+        let any = client
+            .build_footprint_item(
+                "Lib:Fp",
+                "U1",
+                "IC",
+                &[],
+                &[],
+                &fields,
+                100.0,
+                50.0,
+                90.0,
+                "F.Cu",
+            )
+            .unwrap();
+        let footprint =
+            kiapi::board::types::FootprintInstance::decode(any.value.as_slice()).unwrap();
+        let items = &footprint.definition.unwrap().items;
+
+        let property = items
+            .iter()
+            .find(|item| item.type_url.ends_with("types.Field"))
+            .map(|item| kiapi::board::types::Field::decode(item.value.as_slice()).unwrap())
+            .unwrap();
+        assert_eq!(property.name, "KiLib_Generator");
+        assert!(!property.visible);
+        let property_text = property.text.unwrap().text.unwrap();
+        assert_eq!(property_text.text, "package/gullwing");
+        assert_eq!(
+            property_text.position.unwrap(),
+            kiapi::common::types::Vector2 {
+                x_nm: 102_000_000,
+                y_nm: 49_000_000,
+            }
+        );
+
+        let model = items
+            .iter()
+            .find(|item| item.type_url.ends_with("types.Footprint3DModel"))
+            .map(|item| {
+                kiapi::board::types::Footprint3DModel::decode(item.value.as_slice()).unwrap()
+            })
+            .unwrap();
+        assert_eq!(model.opacity, 0.75);
+        assert_eq!(model.offset.unwrap().z_nm, 3.0);
+        assert_eq!(model.scale.unwrap().y_nm, 1.1);
+        assert_eq!(model.rotation.unwrap().x_nm, 10.0);
     }
 
     /// Courtyard rect + silk line + fab text at rotation 90 must come out on
@@ -2698,8 +2803,9 @@ mod footprint_graphics_tests {
         assert!(first.y_nm.abs() < 10, "y={}", first.y_nm);
     }
 
-    /// A circle's radius survives rotation via the circumference-point
-    /// encoding.
+    /// A circle's circumference point rotates with the footprint. KiCad's
+    /// library-parity DRC compares this otherwise geometrically arbitrary
+    /// point, so preserving only the scalar radius leaves a false mismatch.
     #[test]
     fn circle_center_rotates_and_radius_is_preserved() {
         let graphics = vec![IpcGraphicDefinition::Circle {
@@ -2718,11 +2824,11 @@ mod footprint_graphics_tests {
         // Center (1,0) at 90° around (10,10): (10, 9).
         assert_eq!(c.center.unwrap().x_nm, 10_000_000);
         assert_eq!(c.center.unwrap().y_nm, 9_000_000);
-        // Radius 0.5 mm regardless of rotation.
-        assert_eq!(
-            c.radius_point.unwrap().x_nm - c.center.unwrap().x_nm,
-            500_000
-        );
+        // Local end (1.5, 0) at 90° becomes (10, 8.5), not an arbitrary point
+        // 0.5 mm to the right of the transformed center.
+        let radius_point = c.radius_point.unwrap();
+        assert_eq!(radius_point.x_nm, 10_000_000);
+        assert_eq!(radius_point.y_nm, 8_500_000);
     }
 
     /// #117 guard for the pad path: the same PST_NORMAL rule that broke

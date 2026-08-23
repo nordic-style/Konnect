@@ -19,10 +19,7 @@ use konnect_sexp::{
         extract_lib_pins_for_unit, extract_symbol_instances, find_lib_symbol, pin_endpoint,
         pin_outward_direction, read_schematic,
     },
-    writer::{
-        apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, write_new_atomic,
-        SexpEdit,
-    },
+    writer::{apply_edits, read_consistent, write_atomic_if_unchanged, write_new_atomic, SexpEdit},
     ItemId, SchematicCommand,
 };
 use serde_json::json;
@@ -120,6 +117,22 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic", "reference"]
             }),
             |args, ctx| async move { handle_edit_schematic_component(args, ctx).await }
+        ),
+        tool!(
+            "set_schematic_component_flags",
+            "Set KiCad's native DNP, BOM-inclusion, and board-inclusion flags consistently across every placed unit of a component.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "schematic": { "type": "string" },
+                    "reference": { "type": "string", "description": "Component reference designator" },
+                    "dnp": { "type": "boolean", "description": "Mark the component Do Not Populate" },
+                    "in_bom": { "type": "boolean", "description": "Include the component in the BOM" },
+                    "on_board": { "type": "boolean", "description": "Include the component on the PCB" }
+                },
+                "required": ["schematic", "reference"]
+            }),
+            |args, ctx| async move { handle_set_schematic_component_flags(args, ctx).await }
         ),
         tool!(
             "get_schematic_component",
@@ -354,18 +367,6 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["schematic"]
             }),
             |args, ctx| async move { handle_reset_schematic_field_positions(args, ctx).await }
-        ),
-        tool!(
-            "get_schematic_view",
-            "Render the schematic to a PNG image (base64-encoded) via kicad-cli.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "schematic": { "type": "string" }
-                },
-                "required": ["schematic"]
-            }),
-            |args, ctx| async move { handle_get_schematic_view(args, ctx).await }
         ),
     ]
 }
@@ -685,9 +686,9 @@ fn is_reserved_property(name: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PropertyWriteCounts {
-    updated: usize,
-    added: usize,
+pub(crate) struct PropertyWriteCounts {
+    pub(crate) updated: usize,
+    pub(crate) added: usize,
 }
 
 fn escape_property_text(value: &str) -> String {
@@ -754,18 +755,30 @@ fn property_insert_edit(
 
     let escaped_name = escape_property_text(name);
     let escaped_value = escape_property_text(value);
-    let prop = format!(
-        "\n{indent}(property \"{escaped_name}\" \"{escaped_value}\"\n{indent}\t(at {x} {y} 0)\n\
+    let property = format!(
+        "{indent}(property \"{escaped_name}\" \"{escaped_value}\"\n{indent}\t(at {x} {y} 0)\n\
          {indent}\t(hide yes)\n{indent}\t(effects\n{indent}\t\t(font\n{indent}\t\t\t\
          (size 1.27 1.27)\n{indent}\t\t)\n{indent}\t)\n{indent})"
     );
 
     // Insert before the block's closing paren so the property stays inside it.
-    let close = block
+    // Eeschema puts that paren on an indented line of its own. Inserting at the
+    // paren itself used to strand the line's indentation before our leading
+    // newline, producing a whitespace-only line for every added BOM property.
+    let close_relative = block
         .rfind(')')
-        .map(|offset| start + offset)
         .ok_or_else(|| format!("symbol block for '{reference}' is malformed"))?;
-    Ok(SexpEdit::insert(close, prop))
+    let close_line_start = block[..close_relative].rfind('\n').map_or(0, |n| n + 1);
+    let closing_prefix = &block[close_line_start..close_relative];
+    let (insert_at, insertion) = if closing_prefix.trim().is_empty() {
+        // Keep the existing indentation and closing paren intact on the next
+        // line; the new property begins at the old line start.
+        (start + close_line_start, format!("{property}\n"))
+    } else {
+        // Compact/minified fallback: there is no dedicated closing line.
+        (start + close_relative, format!("\n{property}"))
+    };
+    Ok(SexpEdit::insert(insert_at, insertion))
 }
 
 /// Set one shared component property in every placed unit.
@@ -774,7 +787,7 @@ fn property_insert_edit(
 /// Custom fields may be present on only some units in a legacy/broken sheet;
 /// `add_missing=true` updates those copies and fills the missing ones in the
 /// same atomic document command.
-fn set_property_value(
+pub(crate) fn set_property_value(
     content: &str,
     reference: &str,
     field: &str,
@@ -993,6 +1006,84 @@ async fn handle_edit_schematic_component(
     Ok(CallToolResult::json(&result))
 }
 
+async fn handle_set_schematic_component_flags(
+    args: &serde_json::Value,
+    _ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    let sch_path = get_path(args, "schematic")?;
+    let reference = match require_str(args, "reference") {
+        Ok(reference) => reference.to_string(),
+        Err(error) => return Ok(error),
+    };
+
+    let mut requested = Vec::new();
+    for key in ["dnp", "in_bom", "on_board"] {
+        match args.get(key) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Bool(value)) => requested.push((key, *value)),
+            Some(_) => {
+                return Ok(CallToolResult::error(format!(
+                    "Argument '{key}' must be a boolean"
+                )))
+            }
+        }
+    }
+    if requested.is_empty() {
+        return Ok(CallToolResult::error(
+            "At least one of 'dnp', 'in_bom', or 'on_board' is required",
+        ));
+    }
+
+    let expected = read_consistent(&sch_path)?;
+    let mut schematic = cse::Schematic::load(&sch_path)?;
+    let mut matched_units = 0usize;
+    let mut changed = Vec::new();
+
+    for symbol in schematic
+        .symbols
+        .iter_mut()
+        .filter(|symbol| symbol.reference() == Some(reference.as_str()))
+    {
+        matched_units += 1;
+        for (key, value) in &requested {
+            let previous = match *key {
+                "dnp" => std::mem::replace(&mut symbol.dnp, *value),
+                "in_bom" => std::mem::replace(&mut symbol.in_bom, *value),
+                "on_board" => std::mem::replace(&mut symbol.on_board, *value),
+                _ => unreachable!("requested flag is validated above"),
+            };
+            if previous != *value {
+                changed.push(format!("unit {}: {key} {previous} → {value}", symbol.unit));
+            }
+        }
+    }
+
+    if matched_units == 0 {
+        return Ok(CallToolResult::error(format!(
+            "Component '{reference}' not found"
+        )));
+    }
+
+    if !changed.is_empty() {
+        let candidate = schematic.to_source();
+        let item_ids = symbol_item_ids(&expected, &reference)?;
+        let command = SchematicCommand::replace_items_from_document(
+            &expected,
+            &candidate,
+            item_ids,
+            format!("Set component flags on {reference}"),
+        )?;
+        commit_command(&sch_path, &command)?;
+    }
+
+    Ok(CallToolResult::json(&json!({
+        "reference": reference,
+        "matched_units": matched_units,
+        "requested": requested.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+        "changes": changed
+    })))
+}
+
 async fn handle_get_schematic_component(
     args: &serde_json::Value,
     _ctx: &ToolContext,
@@ -1045,6 +1136,9 @@ async fn handle_get_schematic_component(
         "rotation": rotation,
         "mirror_x": mirror.contains('x'),
         "mirror_y": mirror.contains('y'),
+        "dnp": anchor.dnp,
+        "in_bom": anchor.in_bom,
+        "on_board": anchor.on_board,
         "uuid": anchor.uuid,
         "unit_count": units.len(),
         "units": units
@@ -1074,7 +1168,10 @@ async fn handle_list_schematic_components(
                 "y": y,
                 "rotation": rotation,
                 "mirror_x": mirror.contains('x'),
-                "mirror_y": mirror.contains('y')
+                "mirror_y": mirror.contains('y'),
+                "dnp": sym.dnp,
+                "in_bom": sym.in_bom,
+                "on_board": sym.on_board
             })
         })
         .collect();
@@ -1404,31 +1501,6 @@ async fn handle_batch_get_pin_locations(
         .collect();
 
     Ok(CallToolResult::json(&json!({ "components": results })))
-}
-
-async fn handle_get_schematic_view(
-    args: &serde_json::Value,
-    ctx: &ToolContext,
-) -> anyhow::Result<CallToolResult> {
-    let sch_path = get_path(args, "schematic")?;
-    let tmp_dir = std::env::temp_dir().join(format!("konnect_{}", new_uuid()));
-    tokio::fs::create_dir_all(&tmp_dir).await?;
-
-    // KiCAD 10 CLI only supports SVG export for schematics (no bitmap)
-    let svg_path =
-        crate::tools::cli::render_schematic_svg(&ctx.config.kicad_cli, &sch_path, &tmp_dir).await?;
-
-    let svg_content = tokio::fs::read_to_string(&svg_path).await?;
-    tokio::fs::remove_dir_all(&tmp_dir).await.ok();
-
-    // Return as text content (SVG is XML text, not a raster image)
-    Ok(crate::mcp::protocol::CallToolResult {
-        content: vec![crate::mcp::protocol::ToolContent::Text {
-            text: format!("SVG schematic rendered. {} bytes.\n\nNote: KiCAD 10 CLI exports schematics as SVG only (no bitmap). \
-                          The SVG file has been generated. Use export_schematic_pdf for a PDF version.", svg_content.len()),
-        }],
-        is_error: false,
-    })
 }
 
 async fn handle_add_component_annotation(
@@ -3376,7 +3448,7 @@ mod edit_component_tests {
     /// One R1, with an instances path, as eeschema writes it.
     const SCH: &str = "(kicad_sch\n\t(version 20250610)\n\t(generator \"eeschema\")\n\t(uuid \"root\")\n\t(lib_symbols\n\t\t(symbol \"Device:R\"\n\t\t\t(property \"Reference\" \"R\" (at 0 0 0))\n\t\t)\n\t)\n\t(symbol\n\t\t(lib_id \"Device:R\")\n\t\t(at 50 60 0)\n\t\t(unit 1)\n\t\t(uuid \"sym-1\")\n\t\t(property \"Reference\" \"R1\"\n\t\t\t(at 52 58 0)\n\t\t)\n\t\t(property \"Value\" \"10k\"\n\t\t\t(at 52 62 0)\n\t\t)\n\t\t(instances\n\t\t\t(project \"proj\"\n\t\t\t\t(path \"/root\"\n\t\t\t\t\t(reference \"R1\") (unit 1)\n\t\t\t\t)\n\t\t\t)\n\t\t)\n\t)\n\t(sheet_instances\n\t\t(path \"/\" (page \"1\"))\n\t)\n)\n";
 
-    async fn edit(args: serde_json::Value) -> (String, String) {
+    async fn call(tool_name: &str, args: serde_json::Value) -> (String, String) {
         let mut f = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
         f.write_all(SCH.as_bytes()).unwrap();
         f.flush().unwrap();
@@ -3384,10 +3456,7 @@ mod edit_component_tests {
         let mut args = args;
         args["schematic"] = json!(f.path().to_str().unwrap());
 
-        let def = tools()
-            .into_iter()
-            .find(|t| t.name == "edit_schematic_component")
-            .unwrap();
+        let def = tools().into_iter().find(|t| t.name == tool_name).unwrap();
         let ctx = Arc::new(ToolContext::new(
             ServerConfig {
                 kicad_cli: String::new(),
@@ -3406,6 +3475,35 @@ mod edit_component_tests {
             other => panic!("expected text, got {other:?}"),
         };
         (std::fs::read_to_string(f.path()).unwrap(), reply)
+    }
+
+    async fn edit(args: serde_json::Value) -> (String, String) {
+        call("edit_schematic_component", args).await
+    }
+
+    #[tokio::test]
+    async fn native_component_flags_are_written_and_reported() {
+        let (out, reply) = call(
+            "set_schematic_component_flags",
+            json!({
+                "reference": "R1",
+                "dnp": true,
+                "in_bom": false,
+                "on_board": true
+            }),
+        )
+        .await;
+        assert!(out.contains("(dnp yes)"), "native DNP flag missing:\n{out}");
+        assert!(
+            out.contains("(in_bom no)"),
+            "native BOM exclusion missing:\n{out}"
+        );
+        assert!(
+            out.contains("(on_board yes)"),
+            "board inclusion must be preserved:\n{out}"
+        );
+        assert!(reply.contains("matched_units"), "reply: {reply}");
+        assert!(reply.contains("dnp"), "reply: {reply}");
     }
 
     /// #157: the rename must reach the instances path, not just the property.

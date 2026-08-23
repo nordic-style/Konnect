@@ -232,10 +232,37 @@ pub struct IpcBoardExtents {
     pub max: IpcVector2,
 }
 
-/// Footprint-local placement of the Reference and Value text fields, read
-/// from the library footprint so placed parts keep the library's text
-/// positions. A hardcoded offset put the Reference on top of the part's own
-/// silkscreen (silk_overlap DRC warnings in live verification).
+/// A non-mandatory library footprint property such as `KiLib_Generator`.
+///
+/// KiCad serializes these as `Field` items inside the footprint definition.
+/// Keeping them as fields (including hidden fields) is required for an exact
+/// library refresh; turning a visible property into ordinary graphic text or
+/// dropping a hidden one makes `lib_footprint_mismatch` persist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpcPropertyDefinition {
+    pub name: String,
+    pub value: String,
+    pub at: (f64, f64, f64),
+    pub layer: Option<String>,
+    pub visible: bool,
+    pub size: Option<(f64, f64)>,
+    pub stroke_width: Option<f64>,
+}
+
+/// A footprint-local 3D model reference and transform.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpcModelDefinition {
+    pub filename: String,
+    pub offset: (f64, f64, f64),
+    pub scale: (f64, f64, f64),
+    pub rotation: (f64, f64, f64),
+    pub visible: bool,
+    pub opacity: f64,
+}
+
+/// Footprint-local fields and metadata read from the library footprint.
+/// Reference and Value placement retain the library text layout; arbitrary
+/// properties and 3D models retain exact library identity during refresh.
 #[derive(Debug, Clone, Default)]
 pub struct IpcFieldPlacement {
     /// (x, y, rotation) of the Reference text, footprint-local mm/degrees.
@@ -258,4 +285,8 @@ pub struct IpcFieldPlacement {
     pub reference_stroke_width: Option<f64>,
     /// Library stroke width for the Value field.
     pub value_stroke_width: Option<f64>,
+    /// Non-mandatory library properties, including hidden generator metadata.
+    pub properties: Vec<IpcPropertyDefinition>,
+    /// Library 3D models, including their local transforms.
+    pub models: Vec<IpcModelDefinition>,
 }

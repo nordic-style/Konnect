@@ -58,7 +58,7 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "sch_export",
         description: "Export schematic to SVG/PDF/netlist, run ERC, and synchronize a live PCB",
         category: "schematic",
-        tool_count: 7,
+        tool_count: 8,
     },
     ToolsetMeta {
         name: "sch_hierarchy",
@@ -107,6 +107,12 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         description: "JLCPCB parts database, Freerouting installation discovery, datasheet URLs",
         category: "integration",
         tool_count: 8,
+    },
+    ToolsetMeta {
+        name: "autorouting",
+        description: "Revision-bound Specctra export, Freerouting execution, and atomic KiCad import",
+        category: "pcb",
+        tool_count: 1,
     },
     ToolsetMeta {
         name: "verification",
@@ -159,6 +165,7 @@ pub fn tools_for(name: &str) -> Option<Vec<ToolDef>> {
         "pcb_export" => Some(pcb_export::tools()),
         "library" => Some(library::tools()),
         "integration" => Some(integration::tools()),
+        "autorouting" => Some(autorouting::tools()),
         "verification" => Some(verification::tools()),
         "config" => Some(config::tools()),
         "design_review" => Some(design_review::tools()),

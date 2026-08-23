@@ -459,6 +459,44 @@ pub(crate) fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlac
     for property in footprint.find_all("property") {
         if let Some(name) = property.get(1).and_then(|node| node.as_str()) {
             capture(name, property);
+            if !matches!(
+                name,
+                "Reference"
+                    | "reference"
+                    | "Value"
+                    | "value"
+                    | "Datasheet"
+                    | "datasheet"
+                    | "Description"
+                    | "description"
+            ) {
+                let Some(value) = property.get(2).and_then(|node| node.as_str()) else {
+                    continue;
+                };
+                let Ok(((x, y), rotation)) = text_at(property, "property") else {
+                    continue;
+                };
+                let size = property
+                    .find("effects")
+                    .and_then(|effects| effects.find("font"))
+                    .and_then(|font| font.find("size"))
+                    .and_then(|size| Some((size.get_f64(1)?, size.get_f64(2)?)));
+                let stroke_width = property
+                    .find("effects")
+                    .and_then(|effects| effects.find("font"))
+                    .and_then(|font| font.find_f64("thickness"));
+                placement
+                    .properties
+                    .push(konnect_ipc::IpcPropertyDefinition {
+                        name: name.to_string(),
+                        value: value.to_string(),
+                        at: (x, y, rotation),
+                        layer: property.find_str("layer").map(str::to_string),
+                        visible: !text_hidden(property),
+                        size,
+                        stroke_width,
+                    });
+            }
         }
     }
     // KiCad 8-era and intentionally minimal custom libraries still use
@@ -468,6 +506,26 @@ pub(crate) fn extract_field_placement(source: &str) -> konnect_ipc::IpcFieldPlac
         if let Some(kind) = text.get(1).and_then(|node| node.as_str()) {
             capture(kind, text);
         }
+    }
+    let model_xyz = |model: &konnect_sexp::SexpNode, child: &str, default: (f64, f64, f64)| {
+        model
+            .find(child)
+            .and_then(|node| node.find("xyz"))
+            .and_then(|xyz| Some((xyz.get_f64(1)?, xyz.get_f64(2)?, xyz.get_f64(3)?)))
+            .unwrap_or(default)
+    };
+    for model in footprint.find_all("model") {
+        let Some(filename) = model.get(1).and_then(konnect_sexp::SexpNode::as_str) else {
+            continue;
+        };
+        placement.models.push(konnect_ipc::IpcModelDefinition {
+            filename: filename.to_string(),
+            offset: model_xyz(model, "offset", (0.0, 0.0, 0.0)),
+            scale: model_xyz(model, "scale", (1.0, 1.0, 1.0)),
+            rotation: model_xyz(model, "rotate", (0.0, 0.0, 0.0)),
+            visible: !text_hidden(model),
+            opacity: model.find_f64("opacity").unwrap_or(1.0),
+        });
     }
     placement
 }
@@ -557,30 +615,8 @@ pub(crate) fn extract_graphic_definitions(
             size: text_size(text),
         });
     }
-    for property in footprint.find_all("property") {
-        let name = property.get(1).and_then(konnect_sexp::SexpNode::as_str);
-        // Reference and Value travel as first-class fields; hidden built-ins
-        // (Footprint, Datasheet, …) are not drawn.
-        if matches!(name, Some("Reference") | Some("Value")) || text_hidden(property) {
-            continue;
-        }
-        let Some(content) = property.get(2).and_then(konnect_sexp::SexpNode::as_str) else {
-            continue;
-        };
-        let Ok((position, rotation)) = text_at(property, "property") else {
-            continue;
-        };
-        let Ok(layer) = graphic_layer(property, "property") else {
-            continue;
-        };
-        graphics.push(Graphic::Text {
-            text: content.to_string(),
-            position,
-            rotation,
-            layer,
-            size: text_size(property),
-        });
-    }
+    // Properties are fields, not ordinary board text.  They are carried by
+    // `extract_field_placement`, including hidden metadata fields.
     Ok(graphics)
 }
 
@@ -2887,22 +2923,19 @@ fn merge_clean_footprint_children_mode(
     // and any future non-shape child types survived and may contain deliberate
     // per-board customisation, so retain those exact live messages rather than
     // replacing the whole mixed child list from the library.
-    let preserved_non_shapes = preserve_non_shapes
-        .then(|| {
-            current_definition
-                .items
-                .iter()
-                .filter(|child| {
-                    !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad")
-                        && !konnect_ipc::builders::any_is(
-                            child,
-                            "kiapi.board.types.BoardGraphicShape",
-                        )
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let preserved_non_shapes = if preserve_non_shapes {
+        current_definition
+            .items
+            .iter()
+            .filter(|child| {
+                !konnect_ipc::builders::any_is(child, "kiapi.board.types.Pad")
+                    && !konnect_ipc::builders::any_is(child, "kiapi.board.types.BoardGraphicShape")
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     let mut current_pads: BTreeMap<String, VecDeque<kiapi::board::types::Pad>> = BTreeMap::new();
     for child in &current_definition.items {
@@ -2974,7 +3007,11 @@ fn refreshed_library_field(
     let Some(current) = current else {
         return Some(clean.clone());
     };
-    clean.id = current.id.clone();
+    clean.id = current.id;
+    // Visibility is an instance-level board choice. Updating a footprint from
+    // its library must not make deliberately hidden references visible again
+    // (which can immediately introduce silk-over-mask DRC warnings).
+    clean.visible = current.visible;
     if let (Some(clean_text), Some(current_text)) = (clean.text.as_mut(), current.text.as_ref()) {
         clean_text.id = current_text.id.clone();
         clean_text.locked = current_text.locked;
@@ -5249,7 +5286,8 @@ mod tests {
             }),
             visible: true,
         };
-        let current_field = field(7, "placed-field", 9.0);
+        let mut current_field = field(7, "placed-field", 9.0);
+        current_field.visible = false;
         let clean_field = field(0, "library-field", 8.275);
         let current = kiapi::board::types::FootprintInstance {
             reference_field: Some(current_field.clone()),
@@ -5289,6 +5327,7 @@ mod tests {
             kiapi::board::types::FootprintInstance::decode(refreshed.value.as_slice()).unwrap();
         let reference = refreshed.reference_field.as_ref().unwrap();
         assert_eq!(reference.id.as_ref().unwrap().id, 7);
+        assert!(!reference.visible);
         assert_eq!(
             reference.text.as_ref().unwrap().id.as_ref().unwrap().value,
             "placed-field"
@@ -7607,6 +7646,46 @@ mod field_placement_tests {
         let placement = extract_field_placement("(footprint \"bare\")");
         assert_eq!(placement.reference_at, None);
         assert_eq!(placement.value_at, None);
+    }
+
+    #[test]
+    fn hidden_properties_and_3d_models_remain_library_metadata() {
+        let source = r#"(footprint "SOIC"
+  (property "KiLib_Generator" "package/gullwing" (at 0 0 0)
+    (layer "F.SilkS") (hide yes)
+    (effects (font (size 1 0.9) (thickness 0.15))))
+  (model "${KICAD10_3DMODEL_DIR}/Package_SO.3dshapes/SOIC.step"
+    (offset (xyz 1 2 3))
+    (scale (xyz 1 1.1 1.2))
+    (rotate (xyz 10 20 30))))"#;
+
+        let placement = extract_field_placement(source);
+        assert_eq!(placement.properties.len(), 1);
+        assert_eq!(
+            placement.properties[0],
+            konnect_ipc::IpcPropertyDefinition {
+                name: "KiLib_Generator".to_string(),
+                value: "package/gullwing".to_string(),
+                at: (0.0, 0.0, 0.0),
+                layer: Some("F.SilkS".to_string()),
+                visible: false,
+                size: Some((1.0, 0.9)),
+                stroke_width: Some(0.15),
+            }
+        );
+        assert_eq!(placement.models.len(), 1);
+        assert_eq!(
+            placement.models[0],
+            konnect_ipc::IpcModelDefinition {
+                filename: "${KICAD10_3DMODEL_DIR}/Package_SO.3dshapes/SOIC.step".to_string(),
+                offset: (1.0, 2.0, 3.0),
+                scale: (1.0, 1.1, 1.2),
+                rotation: (10.0, 20.0, 30.0),
+                visible: true,
+                opacity: 1.0,
+            }
+        );
+        assert!(extract_graphic_definitions(source).unwrap().is_empty());
     }
 }
 

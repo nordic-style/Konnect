@@ -1,5 +1,6 @@
 //! Tool trait definitions, ToolContext, and all toolset modules.
 
+pub mod autorouting;
 pub mod cli;
 pub mod config;
 pub mod design_review;

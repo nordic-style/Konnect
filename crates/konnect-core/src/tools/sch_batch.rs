@@ -30,8 +30,25 @@ use std::collections::HashSet;
 // Re-use the crate-internal net-graph primitives from sch_analysis.
 use super::sch_analysis::build_net_graph;
 // Re-use the single-item component placer and pin-to-pin router.
-use super::sch_components::place_one_component;
+use super::sch_components::{place_one_component, set_property_value};
 use super::sch_wiring::{resolve_pin_endpoint, resolve_placed_pin, route_between};
+
+/// Remove spaces and tabs at line endings while preserving the file's newline
+/// structure. Older Konnect property insertion left an indented blank line
+/// before every newly added custom field; a successful batch field edit also
+/// repairs those legacy artifacts as part of its one atomic document write.
+fn strip_trailing_horizontal_whitespace(content: &str) -> String {
+    let mut cleaned = String::with_capacity(content.len());
+    for chunk in content.split_inclusive('\n') {
+        if let Some(line) = chunk.strip_suffix('\n') {
+            cleaned.push_str(line.trim_end_matches([' ', '\t']));
+            cleaned.push('\n');
+        } else {
+            cleaned.push_str(chunk.trim_end_matches([' ', '\t']));
+        }
+    }
+    cleaned
+}
 
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
@@ -328,6 +345,7 @@ fn find_symbol_blocks(content: &str, reference: &str) -> Vec<(usize, usize)> {
 ///
 /// Multi-unit parts repeat their fields in every unit's block and KiCad expects
 /// those copies to agree, so a field edit has to rewrite all of them.
+#[cfg(test)]
 fn field_value_ranges(content: &str, reference: &str, field: &str) -> Vec<(usize, usize)> {
     find_all_symbol_instance_blocks(content, reference)
         .into_iter()
@@ -877,7 +895,7 @@ async fn handle_batch_edit(
 
     let content = read_consistent(&sch_path)?;
     let expected = content.clone();
-    let mut file_edits: Vec<SexpEdit> = Vec::new();
+    let mut updated_content = content;
     let mut changed: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
@@ -893,34 +911,41 @@ async fn handle_batch_edit(
         let mut component_changes: Vec<String> = Vec::new();
 
         // Standard fields, then arbitrary extra fields from the "fields" object.
-        // Each is rewritten in every unit's block, which is where a multi-unit
-        // part keeps its copies of the value.
+        // Standard fields must already exist in every unit. Custom fields use
+        // the same add-or-update path as add_component_annotation so the batch
+        // tool fulfils its documented contract instead of rejecting every new
+        // BOM field (#295).
         let extra = edit_spec["fields"].as_object();
-        let specs = [("Value", "value"), ("Footprint", "footprint")]
+        let specs = [("Value", "value", false), ("Footprint", "footprint", false)]
             .into_iter()
-            .filter_map(|(field, key)| Some((field.to_string(), edit_spec[key].as_str()?)))
+            .filter_map(|(field, key, add_missing)| {
+                Some((field.to_string(), edit_spec[key].as_str()?, add_missing))
+            })
             .chain(
                 extra
                     .into_iter()
                     .flatten()
-                    .filter_map(|(name, val)| Some((name.clone(), val.as_str()?))),
+                    .filter_map(|(name, val)| Some((name.clone(), val.as_str()?, true))),
             );
 
-        for (field, new_val) in specs {
-            let ranges = field_value_ranges(&content, reference, &field);
-            if ranges.is_empty() {
-                errors.push(format!("Field '{}' not found on '{}'", field, reference));
-                continue;
+        for (field, new_val, add_missing) in specs {
+            match set_property_value(&updated_content, reference, &field, new_val, add_missing) {
+                Ok((next_content, counts)) => {
+                    updated_content = next_content;
+                    let units = counts.updated + counts.added;
+                    component_changes.push(if counts.added > 0 {
+                        format!(
+                            "{} → {} ({} updated, {} added)",
+                            field, new_val, counts.updated, counts.added
+                        )
+                    } else if units > 1 {
+                        format!("{} → {} ({} units)", field, new_val, units)
+                    } else {
+                        format!("{} → {}", field, new_val)
+                    });
+                }
+                Err(why) => errors.push(format!("{} on '{}': {}", field, reference, why)),
             }
-            let units = ranges.len();
-            for (start, end) in ranges {
-                file_edits.push(SexpEdit::replace(start, end, new_val.to_string()));
-            }
-            component_changes.push(if units > 1 {
-                format!("{} → {} ({} units)", field, new_val, units)
-            } else {
-                format!("{} → {}", field, new_val)
-            });
         }
 
         if !component_changes.is_empty() {
@@ -931,8 +956,10 @@ async fn handle_batch_edit(
         }
     }
 
-    let new_content = apply_edits(content, file_edits);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    if !changed.is_empty() {
+        updated_content = strip_trailing_horizontal_whitespace(&updated_content);
+    }
+    write_atomic_if_unchanged(&sch_path, &expected, &updated_content)?;
 
     Ok(CallToolResult::json(&json!({
         "updated_count": changed.len(),
@@ -2310,8 +2337,12 @@ mod multi_unit_pin_tests {
 
 #[cfg(test)]
 mod multi_unit_field_tests {
-    use super::{field_value_ranges, find_symbol_blocks};
+    use super::{field_value_ranges, find_symbol_blocks, handle_batch_edit};
+    use crate::router::ToolRouter;
+    use crate::tools::{ServerConfig, ToolContext};
     use konnect_sexp::writer::{apply_edits, SexpEdit};
+    use serde_json::json;
+    use std::sync::Arc;
 
     /// A 3-unit part plus an unrelated single-unit part. Every unit repeats the
     /// reference and carries its own copy of the shared fields, which is how
@@ -2399,6 +2430,56 @@ mod multi_unit_field_tests {
     fn missing_field_yields_no_ranges() {
         assert!(field_value_ranges(SCH, "U6", "Datasheet").is_empty());
         assert!(field_value_ranges(SCH, "U99", "Value").is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_edit_adds_a_missing_custom_field_to_every_unit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("multi-unit.kicad_sch");
+        // Simulate the whitespace-only line emitted by older Konnect builds;
+        // the same command that adds/updates fields must clean it up.
+        let legacy = SCH.replacen("\t(symbol\n", "\t \n\t(symbol\n", 1);
+        std::fs::write(&path, legacy).unwrap();
+        let context = ToolContext::new(
+            ServerConfig {
+                kicad_cli: String::new(),
+                kicad_binary: String::new(),
+                ipc_address: String::new(),
+                project_dir: None,
+                jlcpcb_db_path: None,
+                auto_load_toolsets: false,
+                eager_toolsets: false,
+            },
+            Arc::new(ToolRouter::new()),
+        );
+
+        let result = handle_batch_edit(
+            &json!({
+                "schematic": path,
+                "edits": [{
+                    "reference": "U6",
+                    "fields": {"Manufacturer": "Nexperia"}
+                }]
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error, "{result:?}");
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            out.matches(r#"(property "Manufacturer" "Nexperia""#)
+                .count(),
+            3,
+            "custom field must be present on all U6 units:\n{out}"
+        );
+        assert!(out.contains(r#"(property "Reference" "R1""#));
+        assert!(
+            !out.lines()
+                .any(|line| line.ends_with(' ') || line.ends_with('\t')),
+            "batch property edits must not leave trailing whitespace:\n{out}"
+        );
     }
 
     /// Deleting one unit's block used to leave the other six behind as orphans

@@ -12,8 +12,8 @@ Compatibility notes for removed or narrowed arguments are recorded in
 
 ## Overview
 
-- **20 toolsets** organized into 10 categories
-- **213 registered tools** + **6 always-visible meta-tools** = **219 total**
+- **21 toolsets** organized into 10 categories
+- **215 registered tools** + **6 always-visible meta-tools** = **221 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -25,7 +25,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 
 | Tool | Purpose |
 |------|---------|
-| `list_toolboxes` | List all 20 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
+| `list_toolboxes` | List all 21 toolsets with category, tool count, and whether each is currently loaded. The LLM's starting point. |
 | `load_toolset` | Load a toolset by name to expose its tools in `tools/list`. Returns the list of tools added. |
 | `unload_toolset` | Unload a toolset to prune its tools from `tools/list`. Use when switching tasks to keep context small. |
 | `get_active_toolsets` | Return the currently loaded toolsets and how many tools each provides. |
@@ -70,6 +70,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `add_schematic_component` | Add a symbol from a KiCAD library to the schematic. Snaps to the 1.27mm grid. |
 | `delete_schematic_component` | Remove a component and all of its placed units by reference designator. |
 | `edit_schematic_component` | Update shared fields consistently across every placed unit of a component. |
+| `set_schematic_component_flags` | Set KiCad's native DNP, BOM-inclusion, and board-inclusion flags consistently across every placed unit. |
 | `get_schematic_component` | Get shared properties and every placed unit's position for a component. |
 | `list_schematic_components` | List all symbol instances with positions, values, footprints, and pin locations. |
 | `move_schematic_component` | Move the lowest-numbered unit to a new position and translate every other unit by the same delta. Does NOT adjust connected wires. |
@@ -84,7 +85,6 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `replace_component` | Replace every placed unit's `lib_id` while preserving and validating its unit number. |
 | `update_symbols_from_library` | Re-embed placed symbols' definitions from their libraries, like KiCad's "Update Symbols from Library". Refuses a symbol whose pins moved or disappeared (wires attach at pin coordinates) unless `allow_pin_moves` is set. |
 | `reset_schematic_field_positions` | Move each symbol's Reference and Value text back to its library anchor, through the symbol's rotation — KiCad's "Reset field text positions". Repairs sheets whose fields sit at a uniform offset. |
-| `get_schematic_view` | Render the schematic to a PNG image (base64-encoded) via kicad-cli. |
 
 ### `sch_wiring` · 20 tools
 **Purpose:** Wires, net labels, power symbols, junctions, no-connects, pin-to-pin connections.
@@ -165,7 +165,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in a single file read/write cycle. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
 
-### `sch_export` · 7 tools
+### `sch_export` · 8 tools
 **Purpose:** Export schematic to SVG/PDF/netlist, run ERC, and synchronize a live PCB.
 **Source:** [`crates/konnect-core/src/tools/sch_export.rs`](crates/konnect-core/src/tools/sch_export.rs)
 
@@ -178,6 +178,7 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. Routed pad-net reassignment remains blocked unless `allow_routed_pad_net_changes` is explicitly enabled after a local copper check. A uniquely matching reference carrying an obsolete schematic identity remains blocked unless `allow_reference_identity_rebind` is explicitly enabled; the prior identity must be absent from the current design and the footprint library ID must still match. |
+| `get_schematic_view` | Render the schematic through kicad-cli and verify the generated SVG output. |
 
 ### `sch_hierarchy` · 12 tools
 **Purpose:** Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
@@ -300,6 +301,14 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `refill_zones` | Refill every copper pour zone over KiCad IPC. Per-zone selection is not available; requires a running KiCad with the board open. |
 | `get_drc_violations` | Run the Design Rule Check and return a list of violations. |
 
+### `autorouting` · 1 tool
+**Purpose:** Revision-bound Specctra export, Freerouting execution, and atomic KiCad import.
+**Source:** [`crates/konnect-core/src/tools/autorouting.rs`](crates/konnect-core/src/tools/autorouting.rs)
+
+| Tool | Description |
+|------|-------------|
+| `autoroute_with_freerouting` | Safely autoroute a closed KiCad board through the production DSN/SES flow. Requires a dry-run board SHA-256 before apply, works in an isolated run directory, imports into and reloads a scratch board, then atomically replaces the source only if its bytes are unchanged. |
+
 ---
 
 ## Library
@@ -347,9 +356,8 @@ Six tools, grouped into *discovery/routing* and *observability*.
 | `get_datasheet_url` | Retrieve the datasheet URL for a component by MPN or LCSC ID. |
 | `check_freerouting` | Locate a Freerouting installation, including KiCad PCM plugin directories, and verify that its Java runtime is available. |
 
-Migration from the former `autoroute` tool: use Freerouting's KiCad ActionPlugin for
-DSN/SES routing. Konnect no longer advertises `autoroute` because it had no editor
-bridge and every call failed; `check_freerouting` remains available for diagnostics.
+`check_freerouting` remains a discovery diagnostic. For an actual guarded DSN/SES
+round-trip, load the `autorouting` toolset and call `autoroute_with_freerouting`.
 
 ---
 
@@ -362,7 +370,7 @@ bridge and every call failed; `check_freerouting` remains available for diagnost
 | Tool | Description |
 |------|-------------|
 | `run_drc` | Run KiCad's complete configured DRC ruleset and return structured violation results. |
-| `set_design_rules` | Set board-level design rules (clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
+| `set_design_rules` | Set board-level design rules (copper/edge clearance, trace width, via size) in the sibling `.kicad_pro` project file. The board file is not modified. |
 | `get_design_rules` | Return the current design rule constraints from the sibling `.kicad_pro` project file. |
 | `check_kicad_ui` | Check whether the KiCad GUI is running and whether IPC responds within the requested bounded timeout. |
 | `launch_kicad_ui` | Launch the KiCAD GUI application and optionally open a project file. |
